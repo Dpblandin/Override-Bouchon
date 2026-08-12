@@ -7,7 +7,7 @@ use eframe::egui::{
 };
 use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use crate::deployer::TARGET_NAME;
 use crate::deployer::{
     ActiveBouchon, HistoryEntry, create_history_entry, delete_existing_bouchons, deploy_bouchon,
@@ -15,7 +15,7 @@ use crate::deployer::{
     list_history_entries, resolve_bouchon_dir, resolve_history_dir, restore_latest_history,
 };
 use crate::platform;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use crate::platform::ElevationError;
 
 const BACKGROUND: Color32 = Color32::from_rgb(44, 62, 80);
@@ -284,7 +284,7 @@ impl BouchonneurApp {
                 self.show_deployment_success(&outcome.target_path, outcome.replaced_files)
             }
             Err(error) => {
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "windows"))]
                 if error.is_permission_denied() {
                     self.deploy_with_administrator_privileges(
                         &source,
@@ -310,7 +310,7 @@ impl BouchonneurApp {
         show_message("Déploiement réussi", &message, MessageLevel::Info);
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     fn deploy_with_administrator_privileges(
         &mut self,
         source: &Path,
@@ -371,7 +371,7 @@ impl BouchonneurApp {
                 self.status = Status::Success(format!("{count} fichier(s) .do supprimé(s)."));
             }
             Err(error) => {
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "windows"))]
                 if error.is_permission_denied() {
                     self.delete_with_administrator_privileges(
                         &target_directory,
@@ -386,7 +386,7 @@ impl BouchonneurApp {
         }
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     fn delete_with_administrator_privileges(
         &mut self,
         target_directory: &Path,
@@ -437,7 +437,7 @@ impl BouchonneurApp {
         match restore_latest_history(&target_directory, &self.history_directory) {
             Ok(outcome) => self.show_restoration_success(outcome.restored_files),
             Err(error) => {
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "windows"))]
                 if error.is_permission_denied() {
                     self.restore_with_administrator_privileges(&target_directory);
                     return;
@@ -455,7 +455,7 @@ impl BouchonneurApp {
         show_message("Restauration réussie", &message, MessageLevel::Info);
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     fn restore_with_administrator_privileges(&mut self, target_directory: &Path) {
         match platform::restore_with_administrator_privileges(
             &self.history_directory,

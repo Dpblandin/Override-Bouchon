@@ -4,9 +4,10 @@ use std::path::PathBuf;
 
 use bouchonneur::deployer::{TARGET_NAME, create_history_entry};
 use bouchonneur::privileged::{
-    PrivilegedCommand, execute_privileged_command, parse_privileged_command,
+    PrivilegedCommand, PrivilegedResponse, execute_privileged_command, parse_privileged_command,
+    parse_privileged_invocation, read_privileged_response, write_privileged_response,
 };
-use tempfile::tempdir;
+use tempfile::{NamedTempFile, tempdir};
 
 #[test]
 fn parses_privileged_deploy_command() {
@@ -78,6 +79,47 @@ fn ignores_regular_application_arguments() {
             .expect("regular argument"),
         None
     );
+}
+
+#[test]
+fn parses_result_file_for_elevated_invocation() {
+    let invocation = parse_privileged_invocation([
+        OsString::from("--privileged-delete"),
+        OsString::from("C:\\Program Files (x86)\\DmpConnect-JS2"),
+        OsString::from("--result-file"),
+        OsString::from("C:\\Users\\tester\\AppData\\Local\\Temp\\result.txt"),
+    ])
+    .expect("valid invocation")
+    .expect("privileged invocation");
+
+    assert_eq!(
+        invocation.command,
+        PrivilegedCommand::Delete {
+            target_directory: PathBuf::from("C:\\Program Files (x86)\\DmpConnect-JS2"),
+        }
+    );
+    assert_eq!(
+        invocation.result_file,
+        Some(PathBuf::from(
+            "C:\\Users\\tester\\AppData\\Local\\Temp\\result.txt"
+        ))
+    );
+}
+
+#[test]
+fn privileged_response_round_trips_success_and_multiline_errors() {
+    let result_file = NamedTempFile::new().expect("result file");
+
+    for response in [
+        PrivilegedResponse::Success(3),
+        PrivilegedResponse::Error("Accès refusé\nVérifiez les permissions".to_owned()),
+    ] {
+        write_privileged_response(result_file.path(), &response).expect("write response");
+        assert_eq!(
+            read_privileged_response(result_file.path()).expect("read response"),
+            response
+        );
+    }
 }
 
 #[test]

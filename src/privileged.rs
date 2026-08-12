@@ -1,5 +1,7 @@
 use std::ffi::{OsStr, OsString};
-use std::path::PathBuf;
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
 
 use crate::deployer::{
     DeployError, delete_existing_bouchons, deploy_bouchon, restore_latest_history,
@@ -20,9 +22,28 @@ pub enum PrivilegedCommand {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrivilegedInvocation {
+    pub command: PrivilegedCommand,
+    pub result_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrivilegedResponse {
+    Success(usize),
+    Error(String),
+}
+
 pub fn parse_privileged_command(
     arguments: impl IntoIterator<Item = OsString>,
 ) -> Result<Option<PrivilegedCommand>, String> {
+    parse_privileged_invocation(arguments)
+        .map(|invocation| invocation.map(|invocation| invocation.command))
+}
+
+pub fn parse_privileged_invocation(
+    arguments: impl IntoIterator<Item = OsString>,
+) -> Result<Option<PrivilegedInvocation>, String> {
     let mut arguments = arguments.into_iter();
     let Some(command) = arguments.next() else {
         return Ok(None);
@@ -46,11 +67,48 @@ pub fn parse_privileged_command(
         return Ok(None);
     };
 
+    let result_file = match arguments.next() {
+        Some(argument) if argument == OsStr::new("--result-file") => {
+            Some(required_path(&mut arguments, "fichier de résultat")?)
+        }
+        Some(_) => return Err("Trop d'arguments pour l'opération privilégiée.".to_owned()),
+        None => None,
+    };
+
     if arguments.next().is_some() {
         return Err("Trop d'arguments pour l'opération privilégiée.".to_owned());
     }
 
-    Ok(Some(parsed))
+    Ok(Some(PrivilegedInvocation {
+        command: parsed,
+        result_file,
+    }))
+}
+
+pub fn write_privileged_response(path: &Path, response: &PrivilegedResponse) -> io::Result<()> {
+    let contents = match response {
+        PrivilegedResponse::Success(affected_files) => format!("success\n{affected_files}"),
+        PrivilegedResponse::Error(message) => format!("error\n{message}"),
+    };
+    fs::write(path, contents)
+}
+
+pub fn read_privileged_response(path: &Path) -> Result<PrivilegedResponse, String> {
+    let contents = fs::read_to_string(path)
+        .map_err(|error| format!("Impossible de lire le résultat administrateur : {error}"))?;
+    let (status, payload) = contents
+        .split_once('\n')
+        .ok_or_else(|| "Réponse administrateur incomplète.".to_owned())?;
+
+    match status {
+        "success" => payload
+            .trim()
+            .parse()
+            .map(PrivilegedResponse::Success)
+            .map_err(|_| format!("Nombre de fichiers invalide : {payload}")),
+        "error" => Ok(PrivilegedResponse::Error(payload.to_owned())),
+        _ => Err(format!("Statut administrateur inconnu : {status}")),
+    }
 }
 
 pub fn execute_privileged_command(command: PrivilegedCommand) -> Result<usize, DeployError> {
