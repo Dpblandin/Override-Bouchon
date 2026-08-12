@@ -36,6 +36,9 @@ venv/
 *.bak
 *.backup
 
+# Fichiers de compilation Rust
+/target/
+
 # Exécutables compilés (optionnel - décommentez si vous ne voulez pas les versionner)
 # *.exe
-# Bouchonneur*.exe 
+# Bouchonneur*.exe

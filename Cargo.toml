@@ -1,0 +1,16 @@
+[package]
+name = "bouchonneur"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "Déployeur de bouchons pour DmpConnect-JS2"
+
+[dependencies]
+eframe = { version = "0.36.1", default-features = false, features = ["accesskit", "default_fonts", "glow"] }
+rfd = "0.17.2"
+tempfile = "3.27.0"
+thiserror = "2.0.20"
+
+[profile.release]
+lto = "thin"
+strip = true

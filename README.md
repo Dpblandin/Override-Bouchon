@@ -2,6 +2,32 @@
 
 Application graphique moderne pour déployer des fichiers bouchons.
 
+## Migration Rust en cours
+
+Une première version Rust est disponible sur la branche `feat/rust-rewrite`. La version Python reste
+présente comme référence pendant la migration.
+
+Fonctionnalités déjà disponibles dans la version Rust :
+
+- détection du répertoire DmpConnect-JS2 sous Windows et macOS ;
+- liste et édition des fichiers du dossier `bouchons/` ;
+- sélection manuelle du répertoire DmpConnect-JS2 ;
+- déploiement transactionnel avec restauration des anciens `.do` en cas d'échec ;
+- suppression explicite des fichiers `.do` après confirmation ;
+- interface accessible basée sur `eframe`/`egui`.
+
+Le bouton `Infos JDD`, l'élévation Windows et les paquets de distribution restent à finaliser.
+
+### Développement Rust
+
+Le dépôt épingle automatiquement Rust 1.95 avec `rust-toolchain.toml`.
+
+```bash
+cargo run
+cargo test
+cargo clippy --all-targets -- -D warnings
+```
+
 ## 🚀 Fonctionnalités
 
 - **Détection automatique** du dossier DmpConnect-JS2
