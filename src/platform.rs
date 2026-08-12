@@ -7,6 +7,9 @@ use std::env;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use thiserror::Error;
 
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+use crate::privileged::PrivilegedCommand;
+
 #[cfg(target_os = "windows")]
 use std::ffi::{OsStr, OsString};
 #[cfg(target_os = "windows")]
@@ -75,37 +78,26 @@ pub fn open_path(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-pub fn deploy_with_administrator_privileges(
-    source: &Path,
-    target_directory: &Path,
-) -> Result<usize, ElevationError> {
-    run_with_administrator_privileges("deploy", Some(source), target_directory)
-}
-
-#[cfg(target_os = "macos")]
-pub fn delete_with_administrator_privileges(
-    target_directory: &Path,
-) -> Result<usize, ElevationError> {
-    run_with_administrator_privileges("delete", None, target_directory)
-}
-
-#[cfg(target_os = "macos")]
-pub fn restore_with_administrator_privileges(
-    history_directory: &Path,
-    target_directory: &Path,
-) -> Result<usize, ElevationError> {
-    run_with_administrator_privileges("restore", Some(history_directory), target_directory)
-}
-
-#[cfg(target_os = "macos")]
-fn run_with_administrator_privileges(
-    operation: &str,
-    source: Option<&Path>,
-    target_directory: &Path,
-) -> Result<usize, ElevationError> {
+pub fn run_elevated(command: &PrivilegedCommand) -> Result<usize, ElevationError> {
     let executable = env::current_exe()?.canonicalize()?;
-    let target_directory = target_directory.canonicalize()?;
-    let source = source.map(Path::canonicalize).transpose()?;
+    let command = canonicalize_privileged_command(command)?;
+    let (operation, source, target_directory) = match &command {
+        PrivilegedCommand::Deploy {
+            source,
+            target_directory,
+        } => ("deploy", Some(source.as_path()), target_directory.as_path()),
+        PrivilegedCommand::Delete { target_directory } => {
+            ("delete", None, target_directory.as_path())
+        }
+        PrivilegedCommand::Restore {
+            history_directory,
+            target_directory,
+        } => (
+            "restore",
+            Some(history_directory.as_path()),
+            target_directory.as_path(),
+        ),
+    };
 
     let output = Command::new("/usr/bin/osascript")
         .args(["-e", ADMINISTRATOR_SCRIPT])
@@ -113,7 +105,7 @@ fn run_with_administrator_privileges(
         .env("BOUCHONNEUR_OPERATION", operation)
         .env(
             "BOUCHONNEUR_SOURCE",
-            source.as_deref().unwrap_or_else(|| Path::new("")),
+            source.unwrap_or_else(|| Path::new("")),
         )
         .env("BOUCHONNEUR_TARGET", target_directory.as_os_str())
         .output()?;
@@ -134,48 +126,15 @@ fn run_with_administrator_privileges(
 }
 
 #[cfg(target_os = "windows")]
-pub fn deploy_with_administrator_privileges(
-    source: &Path,
-    target_directory: &Path,
-) -> Result<usize, ElevationError> {
-    run_with_administrator_privileges("deploy", Some(source), target_directory)
-}
-
-#[cfg(target_os = "windows")]
-pub fn delete_with_administrator_privileges(
-    target_directory: &Path,
-) -> Result<usize, ElevationError> {
-    run_with_administrator_privileges("delete", None, target_directory)
-}
-
-#[cfg(target_os = "windows")]
-pub fn restore_with_administrator_privileges(
-    history_directory: &Path,
-    target_directory: &Path,
-) -> Result<usize, ElevationError> {
-    run_with_administrator_privileges("restore", Some(history_directory), target_directory)
-}
-
-#[cfg(target_os = "windows")]
-fn run_with_administrator_privileges(
-    operation: &str,
-    source: Option<&Path>,
-    target_directory: &Path,
-) -> Result<usize, ElevationError> {
+pub fn run_elevated(command: &PrivilegedCommand) -> Result<usize, ElevationError> {
     let executable = env::current_exe()?;
-    let target_directory = target_directory.canonicalize()?;
-    let source = source.map(Path::canonicalize).transpose()?;
+    let command = canonicalize_privileged_command(command)?;
     let result_file = Builder::new()
         .prefix("bouchonneur-result-")
         .tempfile()?
         .into_temp_path();
 
-    let mut arguments = Vec::new();
-    arguments.push(OsString::from(format!("--privileged-{operation}")));
-    if let Some(source) = &source {
-        arguments.push(source.as_os_str().to_owned());
-    }
-    arguments.push(target_directory.as_os_str().to_owned());
+    let mut arguments = command.to_cli_arguments();
     arguments.push(OsString::from("--result-file"));
     arguments.push(result_file.as_os_str().to_owned());
 
@@ -232,6 +191,29 @@ fn run_with_administrator_privileges(
             "Le processus administrateur s'est terminé avec le code {exit_code}."
         ))),
         PrivilegedResponse::Error(message) => Err(ElevationError::Failed(message)),
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn canonicalize_privileged_command(command: &PrivilegedCommand) -> io::Result<PrivilegedCommand> {
+    match command {
+        PrivilegedCommand::Deploy {
+            source,
+            target_directory,
+        } => Ok(PrivilegedCommand::Deploy {
+            source: source.canonicalize()?,
+            target_directory: target_directory.canonicalize()?,
+        }),
+        PrivilegedCommand::Delete { target_directory } => Ok(PrivilegedCommand::Delete {
+            target_directory: target_directory.canonicalize()?,
+        }),
+        PrivilegedCommand::Restore {
+            history_directory,
+            target_directory,
+        } => Ok(PrivilegedCommand::Restore {
+            history_directory: history_directory.canonicalize()?,
+            target_directory: target_directory.canonicalize()?,
+        }),
     }
 }
 

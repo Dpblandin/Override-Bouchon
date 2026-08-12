@@ -7,6 +7,10 @@ use crate::deployer::{
     DeployError, delete_existing_bouchons, deploy_bouchon, restore_latest_history,
 };
 
+const DEPLOY_ARGUMENT: &str = "--privileged-deploy";
+const DELETE_ARGUMENT: &str = "--privileged-delete";
+const RESTORE_ARGUMENT: &str = "--privileged-restore";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PrivilegedCommand {
     Deploy {
@@ -20,6 +24,33 @@ pub enum PrivilegedCommand {
         history_directory: PathBuf,
         target_directory: PathBuf,
     },
+}
+
+impl PrivilegedCommand {
+    pub fn to_cli_arguments(&self) -> Vec<OsString> {
+        match self {
+            Self::Deploy {
+                source,
+                target_directory,
+            } => vec![
+                OsString::from(DEPLOY_ARGUMENT),
+                source.as_os_str().to_owned(),
+                target_directory.as_os_str().to_owned(),
+            ],
+            Self::Delete { target_directory } => vec![
+                OsString::from(DELETE_ARGUMENT),
+                target_directory.as_os_str().to_owned(),
+            ],
+            Self::Restore {
+                history_directory,
+                target_directory,
+            } => vec![
+                OsString::from(RESTORE_ARGUMENT),
+                history_directory.as_os_str().to_owned(),
+                target_directory.as_os_str().to_owned(),
+            ],
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,16 +80,16 @@ pub fn parse_privileged_invocation(
         return Ok(None);
     };
 
-    let parsed = if command == OsStr::new("--privileged-deploy") {
+    let parsed = if command == OsStr::new(DEPLOY_ARGUMENT) {
         PrivilegedCommand::Deploy {
             source: required_path(&mut arguments, "fichier source")?,
             target_directory: required_path(&mut arguments, "répertoire cible")?,
         }
-    } else if command == OsStr::new("--privileged-delete") {
+    } else if command == OsStr::new(DELETE_ARGUMENT) {
         PrivilegedCommand::Delete {
             target_directory: required_path(&mut arguments, "répertoire cible")?,
         }
-    } else if command == OsStr::new("--privileged-restore") {
+    } else if command == OsStr::new(RESTORE_ARGUMENT) {
         PrivilegedCommand::Restore {
             history_directory: required_path(&mut arguments, "répertoire d'historique")?,
             target_directory: required_path(&mut arguments, "répertoire cible")?,

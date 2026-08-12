@@ -7,6 +7,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tempfile::{Builder, NamedTempFile};
 use thiserror::Error;
 
+use crate::catalog::BouchonCatalog;
+
 pub const TARGET_NAME: &str = "overrideinsianswer.do";
 const MAX_HISTORY_ENTRIES: usize = 20;
 
@@ -133,34 +135,9 @@ pub fn detect_dmpconnect_dir() -> Option<PathBuf> {
         .find(|path| path.is_dir())
 }
 
-pub fn list_bouchons(directory: &Path) -> Result<Vec<PathBuf>, DeployError> {
-    if !directory.is_dir() {
-        return Ok(Vec::new());
-    }
-
-    let entries = fs::read_dir(directory).map_err(|source| io_error("lire", directory, source))?;
-    let mut files = Vec::new();
-
-    for entry in entries {
-        let entry = entry.map_err(|source| io_error("lire", directory, source))?;
-        let path = entry.path();
-        if path.is_file() {
-            files.push(path);
-        }
-    }
-
-    files.sort_by_cached_key(|path| {
-        path.file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_lowercase()
-    });
-    Ok(files)
-}
-
 pub fn detect_active_bouchon(
     target_directory: &Path,
-    known_bouchons: &[PathBuf],
+    catalog: &BouchonCatalog,
 ) -> Result<Option<ActiveBouchon>, DeployError> {
     validate_target_directory(target_directory)?;
     let files = list_do_files(target_directory)?;
@@ -169,7 +146,7 @@ pub fn detect_active_bouchon(
     };
 
     Ok(Some(ActiveBouchon {
-        source_name: find_matching_bouchon_name(deployed_path, known_bouchons),
+        source_name: catalog.identify_content(deployed_path),
         modified_at: fs::metadata(deployed_path)
             .and_then(|metadata| metadata.modified())
             .ok(),
@@ -181,7 +158,7 @@ pub fn detect_active_bouchon(
 pub fn create_history_entry(
     target_directory: &Path,
     history_root: &Path,
-    known_bouchons: &[PathBuf],
+    catalog: &BouchonCatalog,
 ) -> Result<Option<HistoryEntry>, DeployError> {
     validate_target_directory(target_directory)?;
     let files = list_do_files(target_directory)?;
@@ -202,8 +179,7 @@ pub fn create_history_entry(
         }
     }
 
-    let source_name =
-        preferred_do_file(&files).and_then(|path| find_matching_bouchon_name(path, known_bouchons));
+    let source_name = preferred_do_file(&files).and_then(|path| catalog.identify_content(path));
     let entry = HistoryEntry {
         directory: entry_directory,
         created_at,
@@ -218,7 +194,17 @@ pub fn create_history_entry(
 pub fn list_history_entries(
     target_directory: &Path,
     history_root: &Path,
-    known_bouchons: &[PathBuf],
+    catalog: &BouchonCatalog,
+) -> Result<Vec<HistoryEntry>, DeployError> {
+    scan_history_entries(target_directory, history_root, |path| {
+        catalog.identify_content(path)
+    })
+}
+
+fn scan_history_entries(
+    target_directory: &Path,
+    history_root: &Path,
+    identify: impl Fn(&Path) -> Option<String>,
 ) -> Result<Vec<HistoryEntry>, DeployError> {
     let target_history = target_history_directory(history_root, target_directory);
     if !target_history.is_dir() {
@@ -242,8 +228,7 @@ pub fn list_history_entries(
         if files.is_empty() {
             continue;
         }
-        let source_name = preferred_do_file(&files)
-            .and_then(|path| find_matching_bouchon_name(path, known_bouchons));
+        let source_name = preferred_do_file(&files).and_then(&identify);
         history.push(HistoryEntry {
             directory,
             created_at,
@@ -269,7 +254,7 @@ pub fn restore_latest_history(
     history_root: &Path,
 ) -> Result<RestorationOutcome, DeployError> {
     validate_target_directory(target_directory)?;
-    let history = list_history_entries(target_directory, history_root, &[])?;
+    let history = scan_history_entries(target_directory, history_root, |_| None)?;
     let entry = history
         .first()
         .ok_or_else(|| DeployError::NoHistory(target_directory.to_path_buf()))?;
@@ -441,22 +426,6 @@ fn preferred_do_file(files: &[PathBuf]) -> Option<&Path> {
         })
         .or_else(|| files.first())
         .map(PathBuf::as_path)
-}
-
-fn find_matching_bouchon_name(active_file: &Path, known_bouchons: &[PathBuf]) -> Option<String> {
-    let active_metadata = fs::metadata(active_file).ok()?;
-    let active_content = fs::read(active_file).ok()?;
-
-    known_bouchons.iter().find_map(|candidate| {
-        let same_length =
-            fs::metadata(candidate).is_ok_and(|metadata| metadata.len() == active_metadata.len());
-        if !same_length || fs::read(candidate).ok().as_deref() != Some(active_content.as_slice()) {
-            return None;
-        }
-        candidate
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-    })
 }
 
 fn target_history_directory(history_root: &Path, target_directory: &Path) -> PathBuf {

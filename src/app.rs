@@ -7,17 +7,14 @@ use eframe::egui::{
 };
 use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
 
-#[cfg(any(target_os = "macos", target_os = "windows"))]
-use crate::deployer::TARGET_NAME;
+use crate::catalog::{BouchonCatalog, BouchonValidation};
 use crate::deployer::{
-    ActiveBouchon, HistoryEntry, create_history_entry, delete_existing_bouchons, deploy_bouchon,
-    detect_active_bouchon, detect_dmpconnect_dir, discard_history_entry, list_bouchons,
-    list_history_entries, resolve_bouchon_dir, resolve_history_dir, restore_latest_history,
+    ActiveBouchon, HistoryEntry, detect_active_bouchon, detect_dmpconnect_dir,
+    list_history_entries, resolve_bouchon_dir, resolve_history_dir,
 };
 use crate::platform;
-#[cfg(any(target_os = "macos", target_os = "windows"))]
-use crate::platform::ElevationError;
-use crate::validation::{ValidationError, ValidationOutcome, validate_bouchon};
+use crate::validation::ValidationOutcome;
+use crate::workflow::{BouchonWorkflow, WorkflowError, WorkflowOutcome};
 
 const BACKGROUND: Color32 = Color32::from_rgb(44, 62, 80);
 const SURFACE: Color32 = Color32::from_rgb(52, 73, 94);
@@ -30,9 +27,8 @@ const DANGER: Color32 = Color32::from_rgb(231, 76, 60);
 const TEXT: Color32 = Color32::WHITE;
 
 pub struct BouchonneurApp {
-    bouchon_directory: PathBuf,
-    bouchons: Vec<PathBuf>,
-    selected_bouchon: Option<usize>,
+    catalog: BouchonCatalog,
+    selected_bouchon: Option<PathBuf>,
     bouchon_filter: String,
     bouchon_selector_open: bool,
     focus_bouchon_filter: bool,
@@ -64,8 +60,7 @@ impl BouchonneurApp {
         configure_style(&creation_context.egui_ctx);
 
         let mut app = Self {
-            bouchon_directory: resolve_bouchon_dir(),
-            bouchons: Vec::new(),
+            catalog: BouchonCatalog::new(resolve_bouchon_dir()),
             selected_bouchon: None,
             bouchon_filter: String::new(),
             bouchon_selector_open: false,
@@ -85,14 +80,18 @@ impl BouchonneurApp {
     }
 
     fn refresh_bouchons(&mut self) {
-        let previous_selection = self.selected_path().map(Path::to_path_buf);
+        let previous_selection = self.selected_bouchon.clone();
 
-        match list_bouchons(&self.bouchon_directory) {
-            Ok(bouchons) => {
-                self.bouchons = bouchons;
+        match self.catalog.refresh() {
+            Ok(()) => {
                 self.selected_bouchon = previous_selection
-                    .and_then(|selected| self.bouchons.iter().position(|path| path == &selected))
-                    .or_else(|| (!self.bouchons.is_empty()).then_some(0));
+                    .filter(|selected| self.catalog.entry(selected).is_some())
+                    .or_else(|| {
+                        self.catalog
+                            .entries()
+                            .first()
+                            .map(|entry| entry.path().to_path_buf())
+                    });
                 self.status = Status::Ready;
             }
             Err(error) => self.show_error(error.to_string()),
@@ -104,7 +103,8 @@ impl BouchonneurApp {
     fn refresh_selected_validation(&mut self) {
         self.selected_validation = self
             .selected_path()
-            .map(|path| selected_validation(validate_bouchon(path)));
+            .and_then(|path| self.catalog.entry(path))
+            .map(|entry| selected_validation(entry.validation()));
     }
 
     fn refresh_deployment_state(&mut self) {
@@ -115,14 +115,14 @@ impl BouchonneurApp {
             return;
         }
 
-        match detect_active_bouchon(&target_directory, &self.bouchons) {
+        match detect_active_bouchon(&target_directory, &self.catalog) {
             Ok(active) => self.active_bouchon = active,
             Err(error) => {
                 self.active_bouchon = None;
                 self.status = Status::Error(error.to_string());
             }
         }
-        match list_history_entries(&target_directory, &self.history_directory, &self.bouchons) {
+        match list_history_entries(&target_directory, &self.history_directory, &self.catalog) {
             Ok(history) => self.history = history,
             Err(error) => {
                 self.history.clear();
@@ -133,8 +133,8 @@ impl BouchonneurApp {
 
     fn selected_path(&self) -> Option<&Path> {
         self.selected_bouchon
-            .and_then(|index| self.bouchons.get(index))
-            .map(PathBuf::as_path)
+            .as_deref()
+            .filter(|path| self.catalog.entry(path).is_some())
     }
 
     fn show_bouchon_selector(&mut self, ui: &mut egui::Ui) {
@@ -147,7 +147,7 @@ impl BouchonneurApp {
 
         let selector = ui
             .add_enabled(
-                !self.bouchons.is_empty(),
+                !self.catalog.is_empty(),
                 Button::image_and_text(
                     icon(egui::include_image!("../assets/icons/search.svg")),
                     selected_text,
@@ -199,7 +199,7 @@ impl BouchonneurApp {
                     self.highlighted_bouchon = 0;
                 }
 
-                let matches = matching_bouchon_indices(&self.bouchons, &self.bouchon_filter);
+                let matches = self.catalog.matching_indices(&self.bouchon_filter);
                 let last_match = matches.len().saturating_sub(1);
                 self.highlighted_bouchon = self.highlighted_bouchon.min(last_match);
 
@@ -225,10 +225,7 @@ impl BouchonneurApp {
                     }
 
                     for (position, index) in matches.iter().copied().enumerate() {
-                        let label = self.bouchons[index]
-                            .file_name()
-                            .unwrap_or_default()
-                            .to_string_lossy();
+                        let label = self.catalog.entries()[index].name();
                         let response = ui
                             .selectable_label(position == self.highlighted_bouchon, label)
                             .on_hover_cursor(CursorIcon::PointingHand);
@@ -243,7 +240,7 @@ impl BouchonneurApp {
             });
 
         if let Some(index) = chosen {
-            self.selected_bouchon = Some(index);
+            self.selected_bouchon = Some(self.catalog.entries()[index].path().to_path_buf());
             self.bouchon_filter.clear();
             self.refresh_selected_validation();
             open = false;
@@ -284,46 +281,21 @@ impl BouchonneurApp {
             self.show_error("Veuillez sélectionner un fichier bouchon.".to_owned());
             return;
         };
-        match validate_bouchon(&source) {
-            Ok(outcome) => self.selected_validation = Some(validation_from_outcome(outcome)),
-            Err(error) => {
+        let target_directory = PathBuf::from(self.dmpconnect_directory.trim());
+        let outcome = BouchonWorkflow::new(&self.history_directory, &self.catalog)
+            .deploy(&source, &target_directory);
+
+        match outcome {
+            Ok(WorkflowOutcome::Completed(outcome)) => {
+                self.show_deployment_success(&outcome.target_path, outcome.replaced_files)
+            }
+            Ok(WorkflowOutcome::Cancelled) => self.handle_cancelled_workflow(),
+            Err(WorkflowError::Validation(error)) => {
                 let message = error.to_string();
                 self.selected_validation = Some(SelectedValidation::Invalid(message.clone()));
                 self.show_validation_error(&source, &message);
-                return;
             }
-        }
-        let target_directory = PathBuf::from(self.dmpconnect_directory.trim());
-        let history_entry = match create_history_entry(
-            &target_directory,
-            &self.history_directory,
-            &self.bouchons,
-        ) {
-            Ok(entry) => entry,
-            Err(error) => {
-                self.show_error(error.to_string());
-                return;
-            }
-        };
-
-        match deploy_bouchon(&source, &target_directory) {
-            Ok(outcome) => {
-                self.show_deployment_success(&outcome.target_path, outcome.replaced_files)
-            }
-            Err(error) => {
-                #[cfg(any(target_os = "macos", target_os = "windows"))]
-                if error.is_permission_denied() {
-                    self.deploy_with_administrator_privileges(
-                        &source,
-                        &target_directory,
-                        history_entry.as_ref(),
-                    );
-                    return;
-                }
-
-                discard_history(history_entry.as_ref());
-                self.show_error(error.to_string());
-            }
+            Err(error) => self.show_error(error.to_string()),
         }
     }
 
@@ -335,30 +307,6 @@ impl BouchonneurApp {
         self.refresh_deployment_state();
         self.status = Status::Success(message.clone());
         show_message("Déploiement réussi", &message, MessageLevel::Info);
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
-    fn deploy_with_administrator_privileges(
-        &mut self,
-        source: &Path,
-        target_directory: &Path,
-        history_entry: Option<&HistoryEntry>,
-    ) {
-        match platform::deploy_with_administrator_privileges(source, target_directory) {
-            Ok(replaced_files) => {
-                self.show_deployment_success(&target_directory.join(TARGET_NAME), replaced_files)
-            }
-            Err(ElevationError::Cancelled) => {
-                discard_history(history_entry);
-                self.refresh_deployment_state();
-                self.status = Status::Ready;
-            }
-            Err(error) => {
-                discard_history(history_entry);
-                self.refresh_deployment_state();
-                self.show_error(error.to_string());
-            }
-        }
     }
 
     fn confirm_and_delete_existing(&mut self) {
@@ -380,60 +328,15 @@ impl BouchonneurApp {
             return;
         }
 
-        let history_entry = match create_history_entry(
-            &target_directory,
-            &self.history_directory,
-            &self.bouchons,
-        ) {
-            Ok(entry) => entry,
-            Err(error) => {
-                self.show_error(error.to_string());
-                return;
-            }
-        };
-
-        match delete_existing_bouchons(&target_directory) {
-            Ok(count) => {
+        let outcome =
+            BouchonWorkflow::new(&self.history_directory, &self.catalog).delete(&target_directory);
+        match outcome {
+            Ok(WorkflowOutcome::Completed(count)) => {
                 self.refresh_deployment_state();
                 self.status = Status::Success(format!("{count} fichier(s) .do supprimé(s)."));
             }
-            Err(error) => {
-                #[cfg(any(target_os = "macos", target_os = "windows"))]
-                if error.is_permission_denied() {
-                    self.delete_with_administrator_privileges(
-                        &target_directory,
-                        history_entry.as_ref(),
-                    );
-                    return;
-                }
-
-                discard_history(history_entry.as_ref());
-                self.show_error(error.to_string());
-            }
-        }
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
-    fn delete_with_administrator_privileges(
-        &mut self,
-        target_directory: &Path,
-        history_entry: Option<&HistoryEntry>,
-    ) {
-        match platform::delete_with_administrator_privileges(target_directory) {
-            Ok(count) => {
-                self.refresh_deployment_state();
-                self.status = Status::Success(format!("{count} fichier(s) .do supprimé(s)."));
-            }
-            Err(ElevationError::Cancelled) => {
-                discard_history(history_entry);
-                self.refresh_deployment_state();
-                self.status = Status::Ready;
-            }
-            Err(error) => {
-                discard_history(history_entry);
-                self.refresh_deployment_state();
-                self.show_error(error.to_string());
-            }
+            Ok(WorkflowOutcome::Cancelled) => self.handle_cancelled_workflow(),
+            Err(error) => self.show_error(error.to_string()),
         }
     }
 
@@ -461,17 +364,14 @@ impl BouchonneurApp {
             return;
         }
 
-        match restore_latest_history(&target_directory, &self.history_directory) {
-            Ok(outcome) => self.show_restoration_success(outcome.restored_files),
-            Err(error) => {
-                #[cfg(any(target_os = "macos", target_os = "windows"))]
-                if error.is_permission_denied() {
-                    self.restore_with_administrator_privileges(&target_directory);
-                    return;
-                }
-
-                self.show_error(error.to_string());
+        let outcome =
+            BouchonWorkflow::new(&self.history_directory, &self.catalog).restore(&target_directory);
+        match outcome {
+            Ok(WorkflowOutcome::Completed(outcome)) => {
+                self.show_restoration_success(outcome.restored_files)
             }
+            Ok(WorkflowOutcome::Cancelled) => self.handle_cancelled_workflow(),
+            Err(error) => self.show_error(error.to_string()),
         }
     }
 
@@ -482,16 +382,9 @@ impl BouchonneurApp {
         show_message("Restauration réussie", &message, MessageLevel::Info);
     }
 
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
-    fn restore_with_administrator_privileges(&mut self, target_directory: &Path) {
-        match platform::restore_with_administrator_privileges(
-            &self.history_directory,
-            target_directory,
-        ) {
-            Ok(restored_files) => self.show_restoration_success(restored_files),
-            Err(ElevationError::Cancelled) => self.status = Status::Ready,
-            Err(error) => self.show_error(error.to_string()),
-        }
+    fn handle_cancelled_workflow(&mut self) {
+        self.refresh_deployment_state();
+        self.status = Status::Ready;
     }
 
     fn show_active_bouchon(&mut self, ui: &mut egui::Ui) {
@@ -582,13 +475,29 @@ impl BouchonneurApp {
         let Some(validation) = &self.selected_validation else {
             return;
         };
-        let (message, color) = match validation {
-            SelectedValidation::Valid(message) => (message, SUCCESS),
-            SelectedValidation::Warning(message) => (message, WARNING),
-            SelectedValidation::Invalid(message) => (message, DANGER),
+        let (message, color, validation_icon) = match validation {
+            SelectedValidation::Valid(message) => (
+                message,
+                SUCCESS,
+                egui::include_image!("../assets/icons/active.svg"),
+            ),
+            SelectedValidation::Warning(message) => (
+                message,
+                WARNING,
+                egui::include_image!("../assets/icons/info.svg"),
+            ),
+            SelectedValidation::Invalid(message) => (
+                message,
+                DANGER,
+                egui::include_image!("../assets/icons/info.svg"),
+            ),
         };
         ui.horizontal(|ui| {
-            ui.label(RichText::new("●").color(color));
+            ui.add(
+                Image::new(validation_icon)
+                    .fit_to_exact_size(Vec2::splat(16.0))
+                    .tint(color),
+            );
             ui.label(RichText::new(message).color(color).size(12.0));
         });
     }
@@ -648,7 +557,7 @@ impl eframe::App for BouchonneurApp {
                             ui.label(
                                 RichText::new(format!(
                                     "Dossier : {}",
-                                    self.bouchon_directory.display()
+                                    self.catalog.directory().display()
                                 ))
                                 .size(12.0)
                                 .color(ACCENT),
@@ -825,22 +734,10 @@ fn colored_button(
     .on_hover_cursor(CursorIcon::PointingHand)
 }
 
-fn matching_bouchon_indices(bouchons: &[PathBuf], query: &str) -> Vec<usize> {
-    let query = query.trim().to_lowercase();
-    bouchons
-        .iter()
-        .enumerate()
-        .filter_map(|(index, path)| {
-            let filename = path.file_name()?.to_string_lossy();
-            (query.is_empty() || filename.to_lowercase().contains(&query)).then_some(index)
-        })
-        .collect()
-}
-
-fn selected_validation(result: Result<ValidationOutcome, ValidationError>) -> SelectedValidation {
-    match result {
-        Ok(outcome) => validation_from_outcome(outcome),
-        Err(error) => SelectedValidation::Invalid(error.to_string()),
+fn selected_validation(validation: &BouchonValidation) -> SelectedValidation {
+    match validation {
+        BouchonValidation::Valid(outcome) => validation_from_outcome(outcome.clone()),
+        BouchonValidation::Invalid(message) => SelectedValidation::Invalid(message.clone()),
     }
 }
 
@@ -856,12 +753,6 @@ fn validation_from_outcome(outcome: ValidationOutcome) -> SelectedValidation {
                 "Format {format} non vérifié — déploiement autorisé"
             ))
         }
-    }
-}
-
-fn discard_history(entry: Option<&HistoryEntry>) {
-    if let Some(entry) = entry {
-        let _ = discard_history_entry(entry);
     }
 }
 
@@ -884,29 +775,4 @@ fn show_message(title: &str, description: &str, level: MessageLevel) {
         .set_level(level)
         .set_buttons(MessageButtons::Ok)
         .show();
-}
-
-#[cfg(test)]
-mod tests {
-    use super::matching_bouchon_indices;
-    use std::path::PathBuf;
-
-    #[test]
-    fn matching_bouchons_ignores_case_and_matches_anywhere() {
-        let bouchons = vec![
-            PathBuf::from("CasNominal.xml"),
-            PathBuf::from("bouchon_test_3.json"),
-            PathBuf::from("autre.pdf"),
-        ];
-
-        assert_eq!(matching_bouchon_indices(&bouchons, "TEST_3"), vec![1]);
-        assert_eq!(matching_bouchon_indices(&bouchons, "nominal"), vec![0]);
-    }
-
-    #[test]
-    fn empty_filter_keeps_every_bouchon() {
-        let bouchons = vec![PathBuf::from("a.xml"), PathBuf::from("b.json")];
-
-        assert_eq!(matching_bouchon_indices(&bouchons, "  "), vec![0, 1]);
-    }
 }

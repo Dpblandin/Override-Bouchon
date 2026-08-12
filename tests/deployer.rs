@@ -2,9 +2,10 @@ use std::fs;
 use std::io;
 use std::path::PathBuf;
 
+use bouchonneur::catalog::BouchonCatalog;
 use bouchonneur::deployer::{
     DeployError, TARGET_NAME, create_history_entry, delete_existing_bouchons, deploy_bouchon,
-    detect_active_bouchon, list_bouchons, list_history_entries, restore_latest_history,
+    detect_active_bouchon, list_history_entries, restore_latest_history,
 };
 use tempfile::tempdir;
 
@@ -15,10 +16,11 @@ fn lists_only_regular_files_in_stable_order() {
     fs::write(root.path().join("A.xml"), "a").expect("write a");
     fs::create_dir(root.path().join("nested")).expect("create nested directory");
 
-    let names: Vec<_> = list_bouchons(root.path())
-        .expect("list bouchons")
-        .into_iter()
-        .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+    let names: Vec<_> = BouchonCatalog::load(root.path())
+        .expect("load catalog")
+        .entries()
+        .iter()
+        .map(|entry| entry.name().to_owned())
         .collect();
 
     assert_eq!(names, ["A.xml", "z.json"]);
@@ -97,7 +99,8 @@ fn identifies_the_active_bouchon_by_its_content() {
     fs::write(&known, "known response").expect("known bouchon");
     fs::write(target.path().join(TARGET_NAME), "known response").expect("active bouchon");
 
-    let active = detect_active_bouchon(target.path(), &[known])
+    let catalog = BouchonCatalog::load(library.path()).expect("catalog");
+    let active = detect_active_bouchon(target.path(), &catalog)
         .expect("active detection")
         .expect("active bouchon");
 
@@ -114,11 +117,12 @@ fn saves_and_lists_the_current_bouchon_in_history() {
     fs::write(&known, "previous response").expect("known bouchon");
     fs::write(target.path().join(TARGET_NAME), "previous response").expect("active bouchon");
 
-    create_history_entry(target.path(), history.path(), &[known])
+    let catalog = BouchonCatalog::load(library.path()).expect("catalog");
+    create_history_entry(target.path(), history.path(), &catalog)
         .expect("history creation")
         .expect("history entry");
     let entries =
-        list_history_entries(target.path(), history.path(), &[]).expect("history listing");
+        list_history_entries(target.path(), history.path(), &catalog).expect("history listing");
 
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].file_count, 1);
@@ -134,7 +138,8 @@ fn restores_and_consumes_the_latest_history_entry() {
     let history = tempdir().expect("history directory");
     let active = target.path().join(TARGET_NAME);
     fs::write(&active, "previous response").expect("previous bouchon");
-    create_history_entry(target.path(), history.path(), &[])
+    let catalog = BouchonCatalog::new("");
+    create_history_entry(target.path(), history.path(), &catalog)
         .expect("history creation")
         .expect("history entry");
     fs::write(&active, "current response").expect("current bouchon");
@@ -147,7 +152,7 @@ fn restores_and_consumes_the_latest_history_entry() {
         "previous response"
     );
     assert!(
-        list_history_entries(target.path(), history.path(), &[])
+        list_history_entries(target.path(), history.path(), &catalog)
             .expect("history listing")
             .is_empty()
     );
