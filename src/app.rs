@@ -2,10 +2,10 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use eframe::egui::{
-    self, Align, Button, Color32, CursorIcon, FontId, Image, ImageSource, Key, Layout, Popup,
-    PopupCloseBehavior, RichText, ScrollArea, Stroke, Vec2,
+    self, Align, Button, Color32, CursorIcon, FontId, Image, ImageSource, Key, Layout, Modal,
+    Popup, PopupCloseBehavior, RichText, ScrollArea, Stroke, Vec2,
 };
-use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
+use rfd::FileDialog;
 
 use crate::catalog::{BouchonCatalog, BouchonValidation};
 use crate::deployer::{
@@ -25,6 +25,7 @@ const SUCCESS: Color32 = Color32::from_rgb(39, 174, 96);
 const WARNING: Color32 = Color32::from_rgb(243, 156, 18);
 const DANGER: Color32 = Color32::from_rgb(231, 76, 60);
 const TEXT: Color32 = Color32::WHITE;
+const MODAL_TEXT: Color32 = Color32::from_rgb(235, 240, 245);
 
 pub struct BouchonneurApp {
     catalog: BouchonCatalog,
@@ -39,6 +40,7 @@ pub struct BouchonneurApp {
     active_bouchon: Option<ActiveBouchon>,
     history: Vec<HistoryEntry>,
     status: Status,
+    dialog: Option<AppDialog>,
 }
 
 enum Status {
@@ -52,6 +54,35 @@ enum SelectedValidation {
     Valid(String),
     Warning(String),
     Invalid(String),
+}
+
+#[derive(Clone)]
+struct AppDialog {
+    title: String,
+    message: String,
+    tone: DialogTone,
+    action: DialogAction,
+}
+
+#[derive(Clone, Copy)]
+enum DialogTone {
+    Success,
+    Warning,
+    Danger,
+}
+
+#[derive(Clone)]
+enum DialogAction {
+    Dismiss,
+    Delete,
+    Restore,
+    Edit(PathBuf),
+}
+
+#[derive(Clone, Copy)]
+enum DialogDecision {
+    Cancel,
+    Confirm,
 }
 
 impl BouchonneurApp {
@@ -74,6 +105,7 @@ impl BouchonneurApp {
             active_bouchon: None,
             history: Vec::new(),
             status: Status::Ready,
+            dialog: None,
         };
         app.refresh_bouchons();
         app
@@ -306,28 +338,31 @@ impl BouchonneurApp {
         );
         self.refresh_deployment_state();
         self.status = Status::Success(message.clone());
-        show_message("Déploiement réussi", &message, MessageLevel::Info);
+        self.dialog = Some(AppDialog {
+            title: "Déploiement réussi".to_owned(),
+            message,
+            tone: DialogTone::Success,
+            action: DialogAction::Dismiss,
+        });
     }
 
-    fn confirm_and_delete_existing(&mut self) {
+    fn request_delete_existing(&mut self) {
         let target_directory = PathBuf::from(self.dmpconnect_directory.trim());
         if !target_directory.is_dir() {
             self.show_error("Le répertoire DmpConnect-JS2 est invalide.".to_owned());
             return;
         }
 
-        let confirmed = MessageDialog::new()
-            .set_title("Supprimer le bouchon existant ?")
-            .set_description("Tous les fichiers .do présents dans le répertoire seront supprimés.")
-            .set_level(MessageLevel::Warning)
-            .set_buttons(MessageButtons::YesNo)
-            .show()
-            == MessageDialogResult::Yes;
+        self.dialog = Some(AppDialog {
+            title: "Supprimer le bouchon existant ?".to_owned(),
+            message: "Tous les fichiers .do présents dans le répertoire seront supprimés. Une sauvegarde sera conservée dans l’historique.".to_owned(),
+            tone: DialogTone::Danger,
+            action: DialogAction::Delete,
+        });
+    }
 
-        if !confirmed {
-            return;
-        }
-
+    fn delete_existing(&mut self) {
+        let target_directory = PathBuf::from(self.dmpconnect_directory.trim());
         let outcome =
             BouchonWorkflow::new(&self.history_directory, &self.catalog).delete(&target_directory);
         match outcome {
@@ -340,8 +375,7 @@ impl BouchonneurApp {
         }
     }
 
-    fn confirm_and_restore_previous(&mut self) {
-        let target_directory = PathBuf::from(self.dmpconnect_directory.trim());
+    fn request_restore_previous(&mut self) {
         let Some(previous) = self.history.first() else {
             self.show_error("Aucune version précédente n'est disponible.".to_owned());
             return;
@@ -350,20 +384,16 @@ impl BouchonneurApp {
             .source_name
             .as_deref()
             .unwrap_or("bouchon non identifié");
-        let confirmed = MessageDialog::new()
-            .set_title("Restaurer la version précédente ?")
-            .set_description(format!(
-                "Le bouchon actif sera remplacé par « {previous_name} »."
-            ))
-            .set_level(MessageLevel::Warning)
-            .set_buttons(MessageButtons::YesNo)
-            .show()
-            == MessageDialogResult::Yes;
+        self.dialog = Some(AppDialog {
+            title: "Restaurer la version précédente ?".to_owned(),
+            message: format!("Le bouchon actif sera remplacé par « {previous_name} »."),
+            tone: DialogTone::Warning,
+            action: DialogAction::Restore,
+        });
+    }
 
-        if !confirmed {
-            return;
-        }
-
+    fn restore_previous(&mut self) {
+        let target_directory = PathBuf::from(self.dmpconnect_directory.trim());
         let outcome =
             BouchonWorkflow::new(&self.history_directory, &self.catalog).restore(&target_directory);
         match outcome {
@@ -379,7 +409,12 @@ impl BouchonneurApp {
         let message = format!("Version précédente restaurée ({restored_files} fichier(s)).");
         self.refresh_deployment_state();
         self.status = Status::Success(message.clone());
-        show_message("Restauration réussie", &message, MessageLevel::Info);
+        self.dialog = Some(AppDialog {
+            title: "Restauration réussie".to_owned(),
+            message,
+            tone: DialogTone::Success,
+            action: DialogAction::Dismiss,
+        });
     }
 
     fn handle_cancelled_workflow(&mut self) {
@@ -467,7 +502,7 @@ impl BouchonneurApp {
             restore.on_disabled_hover_text("L'historique est vide")
         };
         if restore.clicked() {
-            self.confirm_and_restore_previous();
+            self.request_restore_previous();
         }
     }
 
@@ -504,27 +539,109 @@ impl BouchonneurApp {
 
     fn show_validation_error(&mut self, path: &Path, message: &str) {
         self.status = Status::Error(message.to_owned());
-        let edit_requested = MessageDialog::new()
-            .set_title("Bouchon invalide")
-            .set_description(format!(
-                "{message}\n\nVoulez-vous ouvrir le fichier pour le corriger ?"
-            ))
-            .set_level(MessageLevel::Error)
-            .set_buttons(MessageButtons::YesNo)
-            .show()
-            == MessageDialogResult::Yes;
-
-        if edit_requested && let Err(error) = platform::open_path(path) {
-            self.show_error(format!(
-                "Impossible d'ouvrir '{}' : {error}",
-                path.display()
-            ));
-        }
+        self.dialog = Some(AppDialog {
+            title: "Bouchon invalide".to_owned(),
+            message: format!("{message}\n\nTu peux ouvrir le fichier pour le corriger."),
+            tone: DialogTone::Danger,
+            action: DialogAction::Edit(path.to_path_buf()),
+        });
     }
 
     fn show_error(&mut self, message: String) {
         self.status = Status::Error(message.clone());
-        show_message("Erreur", &message, MessageLevel::Error);
+        self.dialog = Some(AppDialog {
+            title: "Une erreur est survenue".to_owned(),
+            message,
+            tone: DialogTone::Danger,
+            action: DialogAction::Dismiss,
+        });
+    }
+
+    fn show_dialog(&mut self, context: &egui::Context) {
+        let Some(dialog) = self.dialog.clone() else {
+            return;
+        };
+        let (color, image) = match dialog.tone {
+            DialogTone::Success => (SUCCESS, egui::include_image!("../assets/icons/active.svg")),
+            DialogTone::Warning => (WARNING, egui::include_image!("../assets/icons/restore.svg")),
+            DialogTone::Danger => (DANGER, egui::include_image!("../assets/icons/info.svg")),
+        };
+        let frame = egui::Frame::new()
+            .fill(SURFACE)
+            .stroke(Stroke::new(1.0, color.gamma_multiply(0.7)))
+            .corner_radius(16)
+            .inner_margin(24);
+        let response = Modal::new(egui::Id::new("app-dialog"))
+            .backdrop_color(Color32::from_black_alpha(170))
+            .frame(frame)
+            .show(context, |ui| {
+                ui.set_width(430.0);
+                ui.horizontal(|ui| {
+                    egui::Frame::new()
+                        .fill(color.gamma_multiply(0.22))
+                        .corner_radius(24)
+                        .inner_margin(10)
+                        .show(ui, |ui| {
+                            ui.add(
+                                Image::new(image)
+                                    .fit_to_exact_size(Vec2::splat(26.0))
+                                    .tint(color),
+                            );
+                        });
+                    ui.add_space(6.0);
+                    ui.label(RichText::new(&dialog.title).size(20.0).color(TEXT).strong());
+                });
+                ui.add_space(14.0);
+                ui.add(
+                    egui::Label::new(RichText::new(&dialog.message).size(14.0).color(MODAL_TEXT))
+                        .wrap(),
+                );
+                ui.add_space(20.0);
+
+                let mut decision = None;
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let (primary_label, primary_color) = match dialog.action {
+                        DialogAction::Dismiss => ("OK", ACCENT),
+                        DialogAction::Delete => ("Supprimer", DANGER),
+                        DialogAction::Restore => ("Restaurer", WARNING),
+                        DialogAction::Edit(_) => ("Éditer le fichier", WARNING),
+                    };
+                    if dialog_button(ui, primary_label, primary_color, true).clicked() {
+                        decision = Some(DialogDecision::Confirm);
+                    }
+                    if !matches!(dialog.action, DialogAction::Dismiss)
+                        && dialog_button(ui, "Annuler", FIELD_BACKGROUND, false).clicked()
+                    {
+                        decision = Some(DialogDecision::Cancel);
+                    }
+                });
+                decision
+            });
+
+        let decision = response
+            .inner
+            .or_else(|| response.should_close().then_some(DialogDecision::Cancel));
+        let Some(decision) = decision else {
+            return;
+        };
+        self.dialog = None;
+        if matches!(decision, DialogDecision::Cancel) {
+            return;
+        }
+
+        match dialog.action {
+            DialogAction::Dismiss => {}
+            DialogAction::Delete => self.delete_existing(),
+            DialogAction::Restore => self.restore_previous(),
+            DialogAction::Edit(path) => {
+                if let Err(error) = platform::open_path(&path) {
+                    self.show_error(format!(
+                        "Impossible d'ouvrir '{}' : {error}",
+                        path.display()
+                    ));
+                }
+            }
+        }
     }
 }
 
@@ -657,7 +774,7 @@ impl eframe::App for BouchonneurApp {
                             )
                             .clicked()
                             {
-                                self.confirm_and_delete_existing();
+                                self.request_delete_existing();
                             }
                         });
 
@@ -682,6 +799,7 @@ impl eframe::App for BouchonneurApp {
                         });
                     });
             });
+        self.show_dialog(ui.ctx());
     }
 }
 
@@ -734,6 +852,16 @@ fn colored_button(
     .on_hover_cursor(CursorIcon::PointingHand)
 }
 
+fn dialog_button(ui: &mut egui::Ui, label: &str, color: Color32, strong: bool) -> egui::Response {
+    let text = if strong {
+        RichText::new(label).color(TEXT).strong()
+    } else {
+        RichText::new(label).color(TEXT)
+    };
+    ui.add_sized([140.0, 40.0], Button::new(text).fill(color))
+        .on_hover_cursor(CursorIcon::PointingHand)
+}
+
 fn selected_validation(validation: &BouchonValidation) -> SelectedValidation {
     match validation {
         BouchonValidation::Valid(outcome) => validation_from_outcome(outcome.clone()),
@@ -766,13 +894,4 @@ fn format_relative_time(time: SystemTime) -> String {
         3_600..=86_399 => format!("il y a {} h", elapsed.as_secs() / 3_600),
         seconds => format!("il y a {} j", seconds / 86_400),
     }
-}
-
-fn show_message(title: &str, description: &str, level: MessageLevel) {
-    MessageDialog::new()
-        .set_title(title)
-        .set_description(description)
-        .set_level(level)
-        .set_buttons(MessageButtons::Ok)
-        .show();
 }
