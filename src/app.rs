@@ -1,7 +1,8 @@
 use std::path::{Path, PathBuf};
 
 use eframe::egui::{
-    self, Align, Button, Color32, ComboBox, FontId, Layout, RichText, Stroke, Vec2,
+    self, Align, Button, Color32, CursorIcon, FontId, Image, ImageSource, Key, Layout, Popup,
+    PopupCloseBehavior, RichText, ScrollArea, Stroke, Vec2,
 };
 use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
 
@@ -17,6 +18,8 @@ use crate::platform::ElevationError;
 
 const BACKGROUND: Color32 = Color32::from_rgb(44, 62, 80);
 const SURFACE: Color32 = Color32::from_rgb(52, 73, 94);
+const FIELD_BACKGROUND: Color32 = Color32::from_rgb(62, 85, 108);
+const FIELD_HOVER: Color32 = Color32::from_rgb(72, 98, 124);
 const ACCENT: Color32 = Color32::from_rgb(52, 152, 219);
 const SUCCESS: Color32 = Color32::from_rgb(39, 174, 96);
 const WARNING: Color32 = Color32::from_rgb(243, 156, 18);
@@ -27,6 +30,10 @@ pub struct BouchonneurApp {
     bouchon_directory: PathBuf,
     bouchons: Vec<PathBuf>,
     selected_bouchon: Option<usize>,
+    bouchon_filter: String,
+    bouchon_selector_open: bool,
+    focus_bouchon_filter: bool,
+    highlighted_bouchon: usize,
     dmpconnect_directory: String,
     status: Status,
 }
@@ -39,12 +46,17 @@ enum Status {
 
 impl BouchonneurApp {
     pub fn new(creation_context: &eframe::CreationContext<'_>) -> Self {
+        egui_extras::install_image_loaders(&creation_context.egui_ctx);
         configure_style(&creation_context.egui_ctx);
 
         let mut app = Self {
             bouchon_directory: resolve_bouchon_dir(),
             bouchons: Vec::new(),
             selected_bouchon: None,
+            bouchon_filter: String::new(),
+            bouchon_selector_open: false,
+            focus_bouchon_filter: false,
+            highlighted_bouchon: 0,
             dmpconnect_directory: detect_dmpconnect_dir()
                 .map(|path| path.display().to_string())
                 .unwrap_or_default(),
@@ -73,6 +85,122 @@ impl BouchonneurApp {
         self.selected_bouchon
             .and_then(|index| self.bouchons.get(index))
             .map(PathBuf::as_path)
+    }
+
+    fn show_bouchon_selector(&mut self, ui: &mut egui::Ui) {
+        let selector_width = ui.available_width();
+        let selected_text = self
+            .selected_path()
+            .and_then(Path::file_name)
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Aucun fichier disponible".to_owned());
+
+        let selector = ui
+            .add_enabled(
+                !self.bouchons.is_empty(),
+                Button::image_and_text(
+                    icon(egui::include_image!("../assets/icons/search.svg")),
+                    selected_text,
+                )
+                .right_text(
+                    Image::new(egui::include_image!("../assets/icons/chevron-down.svg"))
+                        .fit_to_exact_size(Vec2::splat(14.0)),
+                )
+                .min_size(Vec2::new(selector_width, 38.0))
+                .truncate(),
+            )
+            .on_hover_cursor(CursorIcon::PointingHand);
+
+        let mut open = self.bouchon_selector_open;
+        if selector.clicked() {
+            open = !open;
+            if open {
+                self.bouchon_filter.clear();
+                self.highlighted_bouchon = 0;
+                self.focus_bouchon_filter = true;
+            }
+        }
+
+        let mut chosen = None;
+        let mut close_requested = false;
+        Popup::from_response(&selector)
+            .open_bool(&mut open)
+            .close_behavior(PopupCloseBehavior::CloseOnClickOutside)
+            .width(selector.rect.width())
+            .show(|ui| {
+                ui.set_min_width(selector.rect.width() - 16.0);
+                let previous_filter = self.bouchon_filter.clone();
+                let arrow_down = ui.input(|input| input.key_pressed(Key::ArrowDown));
+                let arrow_up = ui.input(|input| input.key_pressed(Key::ArrowUp));
+                let enter = ui.input(|input| input.key_pressed(Key::Enter));
+                let escape = ui.input(|input| input.key_pressed(Key::Escape));
+                let filter_response = ui.add(
+                    egui::TextEdit::singleline(&mut self.bouchon_filter)
+                        .hint_text("Rechercher un bouchon…")
+                        .margin(egui::Margin::symmetric(10, 7))
+                        .desired_width(f32::INFINITY),
+                );
+
+                if self.focus_bouchon_filter {
+                    filter_response.request_focus();
+                    self.focus_bouchon_filter = false;
+                }
+                if self.bouchon_filter != previous_filter {
+                    self.highlighted_bouchon = 0;
+                }
+
+                let matches = matching_bouchon_indices(&self.bouchons, &self.bouchon_filter);
+                let last_match = matches.len().saturating_sub(1);
+                self.highlighted_bouchon = self.highlighted_bouchon.min(last_match);
+
+                if filter_response.has_focus() || filter_response.lost_focus() {
+                    if arrow_down {
+                        self.highlighted_bouchon = (self.highlighted_bouchon + 1).min(last_match);
+                    }
+                    if arrow_up {
+                        self.highlighted_bouchon = self.highlighted_bouchon.saturating_sub(1);
+                    }
+                    if enter {
+                        chosen = matches.get(self.highlighted_bouchon).copied();
+                    }
+                    if escape {
+                        close_requested = true;
+                    }
+                }
+
+                ui.add_space(2.0);
+                ScrollArea::vertical().max_height(340.0).show(ui, |ui| {
+                    if matches.is_empty() {
+                        ui.label(RichText::new("Aucun bouchon trouvé").weak());
+                    }
+
+                    for (position, index) in matches.iter().copied().enumerate() {
+                        let label = self.bouchons[index]
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy();
+                        let response = ui
+                            .selectable_label(position == self.highlighted_bouchon, label)
+                            .on_hover_cursor(CursorIcon::PointingHand);
+                        if response.hovered() {
+                            self.highlighted_bouchon = position;
+                        }
+                        if response.clicked() {
+                            chosen = Some(index);
+                        }
+                    }
+                });
+            });
+
+        if let Some(index) = chosen {
+            self.selected_bouchon = Some(index);
+            self.bouchon_filter.clear();
+            open = false;
+        }
+        if close_requested {
+            open = false;
+        }
+        self.bouchon_selector_open = open;
     }
 
     fn browse_dmpconnect_directory(&mut self) {
@@ -221,31 +349,39 @@ impl eframe::App for BouchonneurApp {
                             .color(ACCENT),
                     );
 
-                    let selected_text = self
-                        .selected_path()
-                        .and_then(Path::file_name)
-                        .map(|name| name.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| "Aucun fichier disponible".to_owned());
-
-                    ComboBox::from_id_salt("bouchon-selection")
-                        .selected_text(selected_text)
-                        .width(ui.available_width())
-                        .show_ui(ui, |ui| {
-                            for (index, path) in self.bouchons.iter().enumerate() {
-                                let label = path.file_name().unwrap_or_default().to_string_lossy();
-                                ui.selectable_value(&mut self.selected_bouchon, Some(index), label);
-                            }
-                        });
+                    self.show_bouchon_selector(ui);
 
                     ui.horizontal(|ui| {
-                        if colored_button(ui, "Rafraîchir la liste", ACCENT, 180.0).clicked() {
+                        if colored_button(
+                            ui,
+                            egui::include_image!("../assets/icons/refresh.svg"),
+                            "Rafraîchir la liste",
+                            ACCENT,
+                            180.0,
+                        )
+                        .clicked()
+                        {
                             self.refresh_bouchons();
                         }
-                        if colored_button(ui, "Éditer le fichier", WARNING, 180.0).clicked() {
+                        if colored_button(
+                            ui,
+                            egui::include_image!("../assets/icons/edit.svg"),
+                            "Éditer le fichier",
+                            WARNING,
+                            180.0,
+                        )
+                        .clicked()
+                        {
                             self.edit_selected_bouchon();
                         }
-                        ui.add_enabled(false, Button::new("Infos JDD"))
-                            .on_disabled_hover_text("Lien JDD à configurer");
+                        ui.add_enabled(
+                            false,
+                            Button::image_and_text(
+                                icon(egui::include_image!("../assets/icons/info.svg")),
+                                "Infos JDD",
+                            ),
+                        )
+                        .on_disabled_hover_text("Lien JDD à configurer");
                     });
                 });
 
@@ -258,7 +394,15 @@ impl eframe::App for BouchonneurApp {
                             .desired_width(f32::INFINITY),
                     );
                     ui.with_layout(Layout::top_down(Align::Center), |ui| {
-                        if colored_button(ui, "Parcourir...", WARNING, 160.0).clicked() {
+                        if colored_button(
+                            ui,
+                            egui::include_image!("../assets/icons/folder.svg"),
+                            "Parcourir...",
+                            WARNING,
+                            160.0,
+                        )
+                        .clicked()
+                        {
                             self.browse_dmpconnect_directory();
                         }
                     });
@@ -269,10 +413,25 @@ impl eframe::App for BouchonneurApp {
                 let action_indent = ((ui.available_width() - action_width) / 2.0).max(0.0);
                 ui.horizontal(|ui| {
                     ui.add_space(action_indent);
-                    if colored_button(ui, "DÉPLOYER LE BOUCHON", SUCCESS, 300.0).clicked() {
+                    if colored_button(
+                        ui,
+                        egui::include_image!("../assets/icons/rocket.svg"),
+                        "DÉPLOYER LE BOUCHON",
+                        SUCCESS,
+                        300.0,
+                    )
+                    .clicked()
+                    {
                         self.deploy_selected_bouchon();
                     }
-                    if colored_button(ui, "SUPPRIMER LE BOUCHON EXISTANT", DANGER, 340.0).clicked()
+                    if colored_button(
+                        ui,
+                        egui::include_image!("../assets/icons/trash.svg"),
+                        "SUPPRIMER LE BOUCHON EXISTANT",
+                        DANGER,
+                        340.0,
+                    )
+                    .clicked()
                     {
                         self.confirm_and_delete_existing();
                     }
@@ -305,7 +464,9 @@ fn configure_style(context: &egui::Context) {
     let mut visuals = egui::Visuals::dark();
     visuals.panel_fill = BACKGROUND;
     visuals.window_fill = SURFACE;
-    visuals.widgets.inactive.bg_fill = SURFACE;
+    visuals.text_edit_bg_color = Some(FIELD_BACKGROUND);
+    visuals.widgets.inactive.bg_fill = FIELD_BACKGROUND;
+    visuals.widgets.hovered.bg_fill = FIELD_HOVER;
     visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, TEXT);
     context.set_visuals(visuals);
 
@@ -328,11 +489,36 @@ fn section(ui: &mut egui::Ui, title: &str, content: impl FnOnce(&mut egui::Ui)) 
         });
 }
 
-fn colored_button(ui: &mut egui::Ui, label: &str, color: Color32, width: f32) -> egui::Response {
+fn icon(source: ImageSource<'static>) -> Image<'static> {
+    Image::new(source).fit_to_exact_size(Vec2::splat(18.0))
+}
+
+fn colored_button(
+    ui: &mut egui::Ui,
+    image: ImageSource<'static>,
+    label: &str,
+    color: Color32,
+    width: f32,
+) -> egui::Response {
     ui.add_sized(
         [width, 44.0],
-        Button::new(RichText::new(label).color(TEXT).strong()).fill(color),
+        Button::image_and_text(icon(image), RichText::new(label).color(TEXT).strong())
+            .image_tint_follows_text_color(true)
+            .fill(color),
     )
+    .on_hover_cursor(CursorIcon::PointingHand)
+}
+
+fn matching_bouchon_indices(bouchons: &[PathBuf], query: &str) -> Vec<usize> {
+    let query = query.trim().to_lowercase();
+    bouchons
+        .iter()
+        .enumerate()
+        .filter_map(|(index, path)| {
+            let filename = path.file_name()?.to_string_lossy();
+            (query.is_empty() || filename.to_lowercase().contains(&query)).then_some(index)
+        })
+        .collect()
 }
 
 fn show_message(title: &str, description: &str, level: MessageLevel) {
@@ -342,4 +528,29 @@ fn show_message(title: &str, description: &str, level: MessageLevel) {
         .set_level(level)
         .set_buttons(MessageButtons::Ok)
         .show();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::matching_bouchon_indices;
+    use std::path::PathBuf;
+
+    #[test]
+    fn matching_bouchons_ignores_case_and_matches_anywhere() {
+        let bouchons = vec![
+            PathBuf::from("CasNominal.xml"),
+            PathBuf::from("bouchon_test_3.json"),
+            PathBuf::from("autre.pdf"),
+        ];
+
+        assert_eq!(matching_bouchon_indices(&bouchons, "TEST_3"), vec![1]);
+        assert_eq!(matching_bouchon_indices(&bouchons, "nominal"), vec![0]);
+    }
+
+    #[test]
+    fn empty_filter_keeps_every_bouchon() {
+        let bouchons = vec![PathBuf::from("a.xml"), PathBuf::from("b.json")];
+
+        assert_eq!(matching_bouchon_indices(&bouchons, "  "), vec![0, 1]);
+    }
 }
