@@ -16,6 +16,7 @@ Fonctionnalités déjà disponibles dans la version Rust :
 - suppression explicite des fichiers `.do` après confirmation ;
 - demande des privilèges administrateur uniquement lors d'une écriture protégée sous macOS ;
 - demande UAC ciblée sous Windows uniquement lorsqu'une opération est refusée ;
+- validation des fichiers vides, XML et JSON avant tout déploiement ;
 - identification du bouchon actif par comparaison avec la bibliothèque locale ;
 - historique automatique des 20 dernières versions et restauration de la version précédente ;
 - interface accessible basée sur `eframe`/`egui`.

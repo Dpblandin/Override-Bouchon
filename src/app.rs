@@ -17,6 +17,7 @@ use crate::deployer::{
 use crate::platform;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use crate::platform::ElevationError;
+use crate::validation::{ValidationError, ValidationOutcome, validate_bouchon};
 
 const BACKGROUND: Color32 = Color32::from_rgb(44, 62, 80);
 const SURFACE: Color32 = Color32::from_rgb(52, 73, 94);
@@ -36,6 +37,7 @@ pub struct BouchonneurApp {
     bouchon_selector_open: bool,
     focus_bouchon_filter: bool,
     highlighted_bouchon: usize,
+    selected_validation: Option<SelectedValidation>,
     dmpconnect_directory: String,
     history_directory: PathBuf,
     active_bouchon: Option<ActiveBouchon>,
@@ -47,6 +49,13 @@ enum Status {
     Ready,
     Success(String),
     Error(String),
+}
+
+#[derive(Debug, Clone)]
+enum SelectedValidation {
+    Valid(String),
+    Warning(String),
+    Invalid(String),
 }
 
 impl BouchonneurApp {
@@ -62,6 +71,7 @@ impl BouchonneurApp {
             bouchon_selector_open: false,
             focus_bouchon_filter: false,
             highlighted_bouchon: 0,
+            selected_validation: None,
             dmpconnect_directory: detect_dmpconnect_dir()
                 .map(|path| path.display().to_string())
                 .unwrap_or_default(),
@@ -87,7 +97,14 @@ impl BouchonneurApp {
             }
             Err(error) => self.show_error(error.to_string()),
         }
+        self.refresh_selected_validation();
         self.refresh_deployment_state();
+    }
+
+    fn refresh_selected_validation(&mut self) {
+        self.selected_validation = self
+            .selected_path()
+            .map(|path| selected_validation(validate_bouchon(path)));
     }
 
     fn refresh_deployment_state(&mut self) {
@@ -228,6 +245,7 @@ impl BouchonneurApp {
         if let Some(index) = chosen {
             self.selected_bouchon = Some(index);
             self.bouchon_filter.clear();
+            self.refresh_selected_validation();
             open = false;
         }
         if close_requested {
@@ -266,6 +284,15 @@ impl BouchonneurApp {
             self.show_error("Veuillez sélectionner un fichier bouchon.".to_owned());
             return;
         };
+        match validate_bouchon(&source) {
+            Ok(outcome) => self.selected_validation = Some(validation_from_outcome(outcome)),
+            Err(error) => {
+                let message = error.to_string();
+                self.selected_validation = Some(SelectedValidation::Invalid(message.clone()));
+                self.show_validation_error(&source, &message);
+                return;
+            }
+        }
         let target_directory = PathBuf::from(self.dmpconnect_directory.trim());
         let history_entry = match create_history_entry(
             &target_directory,
@@ -551,6 +578,41 @@ impl BouchonneurApp {
         }
     }
 
+    fn show_selected_validation(&self, ui: &mut egui::Ui) {
+        let Some(validation) = &self.selected_validation else {
+            return;
+        };
+        let (message, color) = match validation {
+            SelectedValidation::Valid(message) => (message, SUCCESS),
+            SelectedValidation::Warning(message) => (message, WARNING),
+            SelectedValidation::Invalid(message) => (message, DANGER),
+        };
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("●").color(color));
+            ui.label(RichText::new(message).color(color).size(12.0));
+        });
+    }
+
+    fn show_validation_error(&mut self, path: &Path, message: &str) {
+        self.status = Status::Error(message.to_owned());
+        let edit_requested = MessageDialog::new()
+            .set_title("Bouchon invalide")
+            .set_description(format!(
+                "{message}\n\nVoulez-vous ouvrir le fichier pour le corriger ?"
+            ))
+            .set_level(MessageLevel::Error)
+            .set_buttons(MessageButtons::YesNo)
+            .show()
+            == MessageDialogResult::Yes;
+
+        if edit_requested && let Err(error) = platform::open_path(path) {
+            self.show_error(format!(
+                "Impossible d'ouvrir '{}' : {error}",
+                path.display()
+            ));
+        }
+    }
+
     fn show_error(&mut self, message: String) {
         self.status = Status::Error(message.clone());
         show_message("Erreur", &message, MessageLevel::Error);
@@ -593,6 +655,7 @@ impl eframe::App for BouchonneurApp {
                             );
 
                             self.show_bouchon_selector(ui);
+                            self.show_selected_validation(ui);
 
                             ui.horizontal(|ui| {
                                 if colored_button(
@@ -772,6 +835,28 @@ fn matching_bouchon_indices(bouchons: &[PathBuf], query: &str) -> Vec<usize> {
             (query.is_empty() || filename.to_lowercase().contains(&query)).then_some(index)
         })
         .collect()
+}
+
+fn selected_validation(result: Result<ValidationOutcome, ValidationError>) -> SelectedValidation {
+    match result {
+        Ok(outcome) => validation_from_outcome(outcome),
+        Err(error) => SelectedValidation::Invalid(error.to_string()),
+    }
+}
+
+fn validation_from_outcome(outcome: ValidationOutcome) -> SelectedValidation {
+    match outcome {
+        ValidationOutcome::Valid(format) => SelectedValidation::Valid(format.label().to_owned()),
+        ValidationOutcome::Unchecked { extension } => {
+            let format = extension.map_or_else(
+                || "sans extension".to_owned(),
+                |extension| format!(".{extension}"),
+            );
+            SelectedValidation::Warning(format!(
+                "Format {format} non vérifié — déploiement autorisé"
+            ))
+        }
+    }
 }
 
 fn discard_history(entry: Option<&HistoryEntry>) {
