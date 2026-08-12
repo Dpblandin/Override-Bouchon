@@ -3,7 +3,8 @@ use std::io;
 use std::path::PathBuf;
 
 use bouchonneur::deployer::{
-    DeployError, TARGET_NAME, delete_existing_bouchons, deploy_bouchon, list_bouchons,
+    DeployError, TARGET_NAME, create_history_entry, delete_existing_bouchons, deploy_bouchon,
+    detect_active_bouchon, list_bouchons, list_history_entries, restore_latest_history,
 };
 use tempfile::tempdir;
 
@@ -86,4 +87,68 @@ fn identifies_permission_denied_errors_for_targeted_elevation() {
     };
 
     assert!(error.is_permission_denied());
+}
+
+#[test]
+fn identifies_the_active_bouchon_by_its_content() {
+    let target = tempdir().expect("target directory");
+    let library = tempdir().expect("bouchon library");
+    let known = library.path().join("cas_nominal.json");
+    fs::write(&known, "known response").expect("known bouchon");
+    fs::write(target.path().join(TARGET_NAME), "known response").expect("active bouchon");
+
+    let active = detect_active_bouchon(target.path(), &[known])
+        .expect("active detection")
+        .expect("active bouchon");
+
+    assert_eq!(active.source_name.as_deref(), Some("cas_nominal.json"));
+    assert_eq!(active.do_file_count, 1);
+}
+
+#[test]
+fn saves_and_lists_the_current_bouchon_in_history() {
+    let target = tempdir().expect("target directory");
+    let history = tempdir().expect("history directory");
+    let library = tempdir().expect("bouchon library");
+    let known = library.path().join("previous.xml");
+    fs::write(&known, "previous response").expect("known bouchon");
+    fs::write(target.path().join(TARGET_NAME), "previous response").expect("active bouchon");
+
+    create_history_entry(target.path(), history.path(), &[known])
+        .expect("history creation")
+        .expect("history entry");
+    let entries =
+        list_history_entries(target.path(), history.path(), &[]).expect("history listing");
+
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].file_count, 1);
+    assert_eq!(
+        fs::read_to_string(entries[0].directory.join(TARGET_NAME)).expect("saved content"),
+        "previous response"
+    );
+}
+
+#[test]
+fn restores_and_consumes_the_latest_history_entry() {
+    let target = tempdir().expect("target directory");
+    let history = tempdir().expect("history directory");
+    let active = target.path().join(TARGET_NAME);
+    fs::write(&active, "previous response").expect("previous bouchon");
+    create_history_entry(target.path(), history.path(), &[])
+        .expect("history creation")
+        .expect("history entry");
+    fs::write(&active, "current response").expect("current bouchon");
+
+    let outcome = restore_latest_history(target.path(), history.path()).expect("restoration");
+
+    assert_eq!(outcome.restored_files, 1);
+    assert_eq!(
+        fs::read_to_string(&active).expect("restored content"),
+        "previous response"
+    );
+    assert!(
+        list_history_entries(target.path(), history.path(), &[])
+            .expect("history listing")
+            .is_empty()
+    );
 }

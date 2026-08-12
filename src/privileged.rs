@@ -1,7 +1,9 @@
 use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 
-use crate::deployer::{DeployError, delete_existing_bouchons, deploy_bouchon};
+use crate::deployer::{
+    DeployError, delete_existing_bouchons, deploy_bouchon, restore_latest_history,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PrivilegedCommand {
@@ -10,6 +12,10 @@ pub enum PrivilegedCommand {
         target_directory: PathBuf,
     },
     Delete {
+        target_directory: PathBuf,
+    },
+    Restore {
+        history_directory: PathBuf,
         target_directory: PathBuf,
     },
 }
@@ -29,6 +35,11 @@ pub fn parse_privileged_command(
         }
     } else if command == OsStr::new("--privileged-delete") {
         PrivilegedCommand::Delete {
+            target_directory: required_path(&mut arguments, "répertoire cible")?,
+        }
+    } else if command == OsStr::new("--privileged-restore") {
+        PrivilegedCommand::Restore {
+            history_directory: required_path(&mut arguments, "répertoire d'historique")?,
             target_directory: required_path(&mut arguments, "répertoire cible")?,
         }
     } else {
@@ -51,6 +62,11 @@ pub fn execute_privileged_command(command: PrivilegedCommand) -> Result<usize, D
         PrivilegedCommand::Delete { target_directory } => {
             delete_existing_bouchons(&target_directory)
         }
+        PrivilegedCommand::Restore {
+            history_directory,
+            target_directory,
+        } => restore_latest_history(&target_directory, &history_directory)
+            .map(|outcome| outcome.restored_files),
     }
 }
 

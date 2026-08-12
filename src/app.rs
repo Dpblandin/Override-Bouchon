@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use eframe::egui::{
     self, Align, Button, Color32, CursorIcon, FontId, Image, ImageSource, Key, Layout, Popup,
@@ -9,8 +10,9 @@ use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult, Messag
 #[cfg(target_os = "macos")]
 use crate::deployer::TARGET_NAME;
 use crate::deployer::{
-    delete_existing_bouchons, deploy_bouchon, detect_dmpconnect_dir, list_bouchons,
-    resolve_bouchon_dir,
+    ActiveBouchon, HistoryEntry, create_history_entry, delete_existing_bouchons, deploy_bouchon,
+    detect_active_bouchon, detect_dmpconnect_dir, discard_history_entry, list_bouchons,
+    list_history_entries, resolve_bouchon_dir, resolve_history_dir, restore_latest_history,
 };
 use crate::platform;
 #[cfg(target_os = "macos")]
@@ -35,6 +37,9 @@ pub struct BouchonneurApp {
     focus_bouchon_filter: bool,
     highlighted_bouchon: usize,
     dmpconnect_directory: String,
+    history_directory: PathBuf,
+    active_bouchon: Option<ActiveBouchon>,
+    history: Vec<HistoryEntry>,
     status: Status,
 }
 
@@ -60,6 +65,9 @@ impl BouchonneurApp {
             dmpconnect_directory: detect_dmpconnect_dir()
                 .map(|path| path.display().to_string())
                 .unwrap_or_default(),
+            history_directory: resolve_history_dir(),
+            active_bouchon: None,
+            history: Vec::new(),
             status: Status::Ready,
         };
         app.refresh_bouchons();
@@ -78,6 +86,31 @@ impl BouchonneurApp {
                 self.status = Status::Ready;
             }
             Err(error) => self.show_error(error.to_string()),
+        }
+        self.refresh_deployment_state();
+    }
+
+    fn refresh_deployment_state(&mut self) {
+        let target_directory = PathBuf::from(self.dmpconnect_directory.trim());
+        if !target_directory.is_dir() {
+            self.active_bouchon = None;
+            self.history.clear();
+            return;
+        }
+
+        match detect_active_bouchon(&target_directory, &self.bouchons) {
+            Ok(active) => self.active_bouchon = active,
+            Err(error) => {
+                self.active_bouchon = None;
+                self.status = Status::Error(error.to_string());
+            }
+        }
+        match list_history_entries(&target_directory, &self.history_directory, &self.bouchons) {
+            Ok(history) => self.history = history,
+            Err(error) => {
+                self.history.clear();
+                self.status = Status::Error(error.to_string());
+            }
         }
     }
 
@@ -213,6 +246,7 @@ impl BouchonneurApp {
         if let Some(directory) = dialog.pick_folder() {
             self.dmpconnect_directory = directory.display().to_string();
             self.status = Status::Ready;
+            self.refresh_deployment_state();
         }
     }
 
@@ -233,6 +267,17 @@ impl BouchonneurApp {
             return;
         };
         let target_directory = PathBuf::from(self.dmpconnect_directory.trim());
+        let history_entry = match create_history_entry(
+            &target_directory,
+            &self.history_directory,
+            &self.bouchons,
+        ) {
+            Ok(entry) => entry,
+            Err(error) => {
+                self.show_error(error.to_string());
+                return;
+            }
+        };
 
         match deploy_bouchon(&source, &target_directory) {
             Ok(outcome) => {
@@ -241,10 +286,15 @@ impl BouchonneurApp {
             Err(error) => {
                 #[cfg(target_os = "macos")]
                 if error.is_permission_denied() {
-                    self.deploy_with_administrator_privileges(&source, &target_directory);
+                    self.deploy_with_administrator_privileges(
+                        &source,
+                        &target_directory,
+                        history_entry.as_ref(),
+                    );
                     return;
                 }
 
+                discard_history(history_entry.as_ref());
                 self.show_error(error.to_string());
             }
         }
@@ -255,18 +305,32 @@ impl BouchonneurApp {
             "Bouchon déployé dans '{}'. {replaced_files} ancien(s) fichier(s) remplacé(s).",
             target_path.display(),
         );
+        self.refresh_deployment_state();
         self.status = Status::Success(message.clone());
         show_message("Déploiement réussi", &message, MessageLevel::Info);
     }
 
     #[cfg(target_os = "macos")]
-    fn deploy_with_administrator_privileges(&mut self, source: &Path, target_directory: &Path) {
+    fn deploy_with_administrator_privileges(
+        &mut self,
+        source: &Path,
+        target_directory: &Path,
+        history_entry: Option<&HistoryEntry>,
+    ) {
         match platform::deploy_with_administrator_privileges(source, target_directory) {
             Ok(replaced_files) => {
                 self.show_deployment_success(&target_directory.join(TARGET_NAME), replaced_files)
             }
-            Err(ElevationError::Cancelled) => self.status = Status::Ready,
-            Err(error) => self.show_error(error.to_string()),
+            Err(ElevationError::Cancelled) => {
+                discard_history(history_entry);
+                self.refresh_deployment_state();
+                self.status = Status::Ready;
+            }
+            Err(error) => {
+                discard_history(history_entry);
+                self.refresh_deployment_state();
+                self.show_error(error.to_string());
+            }
         }
     }
 
@@ -289,14 +353,93 @@ impl BouchonneurApp {
             return;
         }
 
+        let history_entry = match create_history_entry(
+            &target_directory,
+            &self.history_directory,
+            &self.bouchons,
+        ) {
+            Ok(entry) => entry,
+            Err(error) => {
+                self.show_error(error.to_string());
+                return;
+            }
+        };
+
         match delete_existing_bouchons(&target_directory) {
             Ok(count) => {
+                self.refresh_deployment_state();
                 self.status = Status::Success(format!("{count} fichier(s) .do supprimé(s)."));
             }
             Err(error) => {
                 #[cfg(target_os = "macos")]
                 if error.is_permission_denied() {
-                    self.delete_with_administrator_privileges(&target_directory);
+                    self.delete_with_administrator_privileges(
+                        &target_directory,
+                        history_entry.as_ref(),
+                    );
+                    return;
+                }
+
+                discard_history(history_entry.as_ref());
+                self.show_error(error.to_string());
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn delete_with_administrator_privileges(
+        &mut self,
+        target_directory: &Path,
+        history_entry: Option<&HistoryEntry>,
+    ) {
+        match platform::delete_with_administrator_privileges(target_directory) {
+            Ok(count) => {
+                self.refresh_deployment_state();
+                self.status = Status::Success(format!("{count} fichier(s) .do supprimé(s)."));
+            }
+            Err(ElevationError::Cancelled) => {
+                discard_history(history_entry);
+                self.refresh_deployment_state();
+                self.status = Status::Ready;
+            }
+            Err(error) => {
+                discard_history(history_entry);
+                self.refresh_deployment_state();
+                self.show_error(error.to_string());
+            }
+        }
+    }
+
+    fn confirm_and_restore_previous(&mut self) {
+        let target_directory = PathBuf::from(self.dmpconnect_directory.trim());
+        let Some(previous) = self.history.first() else {
+            self.show_error("Aucune version précédente n'est disponible.".to_owned());
+            return;
+        };
+        let previous_name = previous
+            .source_name
+            .as_deref()
+            .unwrap_or("bouchon non identifié");
+        let confirmed = MessageDialog::new()
+            .set_title("Restaurer la version précédente ?")
+            .set_description(format!(
+                "Le bouchon actif sera remplacé par « {previous_name} »."
+            ))
+            .set_level(MessageLevel::Warning)
+            .set_buttons(MessageButtons::YesNo)
+            .show()
+            == MessageDialogResult::Yes;
+
+        if !confirmed {
+            return;
+        }
+
+        match restore_latest_history(&target_directory, &self.history_directory) {
+            Ok(outcome) => self.show_restoration_success(outcome.restored_files),
+            Err(error) => {
+                #[cfg(target_os = "macos")]
+                if error.is_permission_denied() {
+                    self.restore_with_administrator_privileges(&target_directory);
                     return;
                 }
 
@@ -305,14 +448,106 @@ impl BouchonneurApp {
         }
     }
 
+    fn show_restoration_success(&mut self, restored_files: usize) {
+        let message = format!("Version précédente restaurée ({restored_files} fichier(s)).");
+        self.refresh_deployment_state();
+        self.status = Status::Success(message.clone());
+        show_message("Restauration réussie", &message, MessageLevel::Info);
+    }
+
     #[cfg(target_os = "macos")]
-    fn delete_with_administrator_privileges(&mut self, target_directory: &Path) {
-        match platform::delete_with_administrator_privileges(target_directory) {
-            Ok(count) => {
-                self.status = Status::Success(format!("{count} fichier(s) .do supprimé(s)."));
-            }
+    fn restore_with_administrator_privileges(&mut self, target_directory: &Path) {
+        match platform::restore_with_administrator_privileges(
+            &self.history_directory,
+            target_directory,
+        ) {
+            Ok(restored_files) => self.show_restoration_success(restored_files),
             Err(ElevationError::Cancelled) => self.status = Status::Ready,
             Err(error) => self.show_error(error.to_string()),
+        }
+    }
+
+    fn show_active_bouchon(&mut self, ui: &mut egui::Ui) {
+        match &self.active_bouchon {
+            Some(active) => {
+                let name = active
+                    .source_name
+                    .as_deref()
+                    .unwrap_or("Bouchon non identifié");
+                ui.horizontal(|ui| {
+                    ui.add(
+                        Image::new(egui::include_image!("../assets/icons/active.svg"))
+                            .fit_to_exact_size(Vec2::splat(18.0))
+                            .tint(SUCCESS),
+                    );
+                    ui.label(RichText::new(name).strong().size(15.0));
+                    if active.source_name.is_none() {
+                        ui.label(RichText::new("contenu externe à la bibliothèque").weak());
+                    }
+                });
+                ui.label(
+                    RichText::new(format!(
+                        "Installé {} · {}",
+                        active
+                            .modified_at
+                            .map(format_relative_time)
+                            .unwrap_or_else(|| "à une date inconnue".to_owned()),
+                        active.deployed_path.display()
+                    ))
+                    .size(12.0)
+                    .color(ACCENT),
+                );
+                if active.do_file_count > 1 {
+                    ui.label(
+                        RichText::new(format!(
+                            "Attention : {} fichiers .do sont présents.",
+                            active.do_file_count
+                        ))
+                        .color(WARNING),
+                    );
+                }
+            }
+            None => {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("●").color(Color32::GRAY));
+                    ui.label(RichText::new("Aucun bouchon actif détecté").strong());
+                });
+            }
+        }
+
+        ui.add_space(4.0);
+        let history_description = self.history.first().map_or_else(
+            || "Aucune version précédente disponible".to_owned(),
+            |entry| {
+                format!(
+                    "{} version(s) · dernière sauvegarde : {} ({})",
+                    self.history.len(),
+                    entry
+                        .source_name
+                        .as_deref()
+                        .unwrap_or("bouchon non identifié"),
+                    format_relative_time(entry.created_at)
+                )
+            },
+        );
+        ui.label(RichText::new(history_description).weak().size(12.0));
+
+        let can_restore = !self.history.is_empty();
+        let restore = ui.add_enabled(
+            can_restore,
+            Button::image_and_text(
+                icon(egui::include_image!("../assets/icons/restore.svg")),
+                "Restaurer la version précédente",
+            )
+            .fill(WARNING),
+        );
+        let restore = if can_restore {
+            restore.on_hover_cursor(CursorIcon::PointingHand)
+        } else {
+            restore.on_disabled_hover_text("L'historique est vide")
+        };
+        if restore.clicked() {
+            self.confirm_and_restore_previous();
         }
     }
 
@@ -327,135 +562,153 @@ impl eframe::App for BouchonneurApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(BACKGROUND).inner_margin(18))
             .show(ui, |ui| {
-                ui.vertical_centered(|ui| {
-                    ui.label(
-                        RichText::new("Bouchonneur")
-                            .font(FontId::proportional(30.0))
-                            .strong(),
-                    );
-                    ui.label(
-                        RichText::new("Déployeur de bouchons")
-                            .size(15.0)
-                            .color(ACCENT),
-                    );
-                    ui.add_space(12.0);
-                });
+                ScrollArea::vertical()
+                    .id_salt("main-content")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.vertical_centered(|ui| {
+                            ui.label(
+                                RichText::new("Bouchonneur")
+                                    .font(FontId::proportional(30.0))
+                                    .strong(),
+                            );
+                            ui.label(
+                                RichText::new("Déployeur de bouchons")
+                                    .size(15.0)
+                                    .color(ACCENT),
+                            );
+                            ui.add_space(12.0);
+                        });
 
-                section(ui, "Sélection du fichier bouchon", |ui| {
-                    ui.label("Fichiers disponibles dans le dossier 'bouchons/' :");
-                    ui.label(
-                        RichText::new(format!("Dossier : {}", self.bouchon_directory.display()))
-                            .size(12.0)
-                            .color(ACCENT),
-                    );
+                        section(ui, "Sélection du fichier bouchon", |ui| {
+                            ui.label("Fichiers disponibles dans le dossier 'bouchons/' :");
+                            ui.label(
+                                RichText::new(format!(
+                                    "Dossier : {}",
+                                    self.bouchon_directory.display()
+                                ))
+                                .size(12.0)
+                                .color(ACCENT),
+                            );
 
-                    self.show_bouchon_selector(ui);
+                            self.show_bouchon_selector(ui);
 
-                    ui.horizontal(|ui| {
-                        if colored_button(
-                            ui,
-                            egui::include_image!("../assets/icons/refresh.svg"),
-                            "Rafraîchir la liste",
-                            ACCENT,
-                            180.0,
-                        )
-                        .clicked()
-                        {
-                            self.refresh_bouchons();
-                        }
-                        if colored_button(
-                            ui,
-                            egui::include_image!("../assets/icons/edit.svg"),
-                            "Éditer le fichier",
-                            WARNING,
-                            180.0,
-                        )
-                        .clicked()
-                        {
-                            self.edit_selected_bouchon();
-                        }
-                        ui.add_enabled(
-                            false,
-                            Button::image_and_text(
-                                icon(egui::include_image!("../assets/icons/info.svg")),
-                                "Infos JDD",
-                            ),
-                        )
-                        .on_disabled_hover_text("Lien JDD à configurer");
+                            ui.horizontal(|ui| {
+                                if colored_button(
+                                    ui,
+                                    egui::include_image!("../assets/icons/refresh.svg"),
+                                    "Rafraîchir la liste",
+                                    ACCENT,
+                                    180.0,
+                                )
+                                .clicked()
+                                {
+                                    self.refresh_bouchons();
+                                }
+                                if colored_button(
+                                    ui,
+                                    egui::include_image!("../assets/icons/edit.svg"),
+                                    "Éditer le fichier",
+                                    WARNING,
+                                    180.0,
+                                )
+                                .clicked()
+                                {
+                                    self.edit_selected_bouchon();
+                                }
+                                ui.add_enabled(
+                                    false,
+                                    Button::image_and_text(
+                                        icon(egui::include_image!("../assets/icons/info.svg")),
+                                        "Infos JDD",
+                                    ),
+                                )
+                                .on_disabled_hover_text("Lien JDD à configurer");
+                            });
+                        });
+
+                        ui.add_space(12.0);
+
+                        section(ui, "Répertoire DmpConnect-JS2", |ui| {
+                            ui.label("Chemin du dossier DmpConnect-JS2 :");
+                            let path_response = ui.add(
+                                egui::TextEdit::singleline(&mut self.dmpconnect_directory)
+                                    .desired_width(f32::INFINITY),
+                            );
+                            if path_response.lost_focus() {
+                                self.refresh_deployment_state();
+                            }
+                            ui.with_layout(Layout::top_down(Align::Center), |ui| {
+                                if colored_button(
+                                    ui,
+                                    egui::include_image!("../assets/icons/folder.svg"),
+                                    "Parcourir...",
+                                    WARNING,
+                                    160.0,
+                                )
+                                .clicked()
+                                {
+                                    self.browse_dmpconnect_directory();
+                                }
+                            });
+                        });
+
+                        ui.add_space(12.0);
+
+                        section(ui, "Bouchon actuellement installé", |ui| {
+                            self.show_active_bouchon(ui);
+                        });
+
+                        ui.add_space(14.0);
+                        let action_width = 300.0 + 340.0 + ui.spacing().item_spacing.x;
+                        let action_indent = ((ui.available_width() - action_width) / 2.0).max(0.0);
+                        ui.horizontal(|ui| {
+                            ui.add_space(action_indent);
+                            if colored_button(
+                                ui,
+                                egui::include_image!("../assets/icons/rocket.svg"),
+                                "DÉPLOYER LE BOUCHON",
+                                SUCCESS,
+                                300.0,
+                            )
+                            .clicked()
+                            {
+                                self.deploy_selected_bouchon();
+                            }
+                            if colored_button(
+                                ui,
+                                egui::include_image!("../assets/icons/trash.svg"),
+                                "SUPPRIMER LE BOUCHON EXISTANT",
+                                DANGER,
+                                340.0,
+                            )
+                            .clicked()
+                            {
+                                self.confirm_and_delete_existing();
+                            }
+                        });
+
+                        ui.add_space(12.0);
+                        ui.separator();
+                        ui.add_space(4.0);
+                        let (status, color) = match &self.status {
+                            Status::Ready => ("Prêt à bouchonner !", TEXT),
+                            Status::Success(message) => (message.as_str(), SUCCESS),
+                            Status::Error(message) => (message.as_str(), DANGER),
+                        };
+                        ui.vertical_centered(|ui| {
+                            ui.label(RichText::new(status).color(color));
+                        });
+                        ui.add_space(3.0);
+                        ui.vertical_centered(|ui| {
+                            ui.label(
+                                RichText::new("Bouchonneur Rust v0.1")
+                                    .size(11.0)
+                                    .color(ACCENT),
+                            );
+                        });
                     });
-                });
-
-                ui.add_space(12.0);
-
-                section(ui, "Répertoire DmpConnect-JS2", |ui| {
-                    ui.label("Chemin du dossier DmpConnect-JS2 :");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.dmpconnect_directory)
-                            .desired_width(f32::INFINITY),
-                    );
-                    ui.with_layout(Layout::top_down(Align::Center), |ui| {
-                        if colored_button(
-                            ui,
-                            egui::include_image!("../assets/icons/folder.svg"),
-                            "Parcourir...",
-                            WARNING,
-                            160.0,
-                        )
-                        .clicked()
-                        {
-                            self.browse_dmpconnect_directory();
-                        }
-                    });
-                });
-
-                ui.add_space(14.0);
-                let action_width = 300.0 + 340.0 + ui.spacing().item_spacing.x;
-                let action_indent = ((ui.available_width() - action_width) / 2.0).max(0.0);
-                ui.horizontal(|ui| {
-                    ui.add_space(action_indent);
-                    if colored_button(
-                        ui,
-                        egui::include_image!("../assets/icons/rocket.svg"),
-                        "DÉPLOYER LE BOUCHON",
-                        SUCCESS,
-                        300.0,
-                    )
-                    .clicked()
-                    {
-                        self.deploy_selected_bouchon();
-                    }
-                    if colored_button(
-                        ui,
-                        egui::include_image!("../assets/icons/trash.svg"),
-                        "SUPPRIMER LE BOUCHON EXISTANT",
-                        DANGER,
-                        340.0,
-                    )
-                    .clicked()
-                    {
-                        self.confirm_and_delete_existing();
-                    }
-                });
-
-                ui.add_space(12.0);
-                ui.separator();
-                ui.add_space(4.0);
-                let (status, color) = match &self.status {
-                    Status::Ready => ("Prêt à bouchonner !", TEXT),
-                    Status::Success(message) => (message.as_str(), SUCCESS),
-                    Status::Error(message) => (message.as_str(), DANGER),
-                };
-                ui.vertical_centered(|ui| {
-                    ui.label(RichText::new(status).color(color));
-                });
-                ui.add_space(3.0);
-                ui.vertical_centered(|ui| {
-                    ui.label(
-                        RichText::new("Bouchonneur Rust v0.1")
-                            .size(11.0)
-                            .color(ACCENT),
-                    );
-                });
             });
     }
 }
@@ -519,6 +772,24 @@ fn matching_bouchon_indices(bouchons: &[PathBuf], query: &str) -> Vec<usize> {
             (query.is_empty() || filename.to_lowercase().contains(&query)).then_some(index)
         })
         .collect()
+}
+
+fn discard_history(entry: Option<&HistoryEntry>) {
+    if let Some(entry) = entry {
+        let _ = discard_history_entry(entry);
+    }
+}
+
+fn format_relative_time(time: SystemTime) -> String {
+    let elapsed = SystemTime::now()
+        .duration_since(time)
+        .unwrap_or(Duration::ZERO);
+    match elapsed.as_secs() {
+        0..=59 => "à l’instant".to_owned(),
+        60..=3_599 => format!("il y a {} min", elapsed.as_secs() / 60),
+        3_600..=86_399 => format!("il y a {} h", elapsed.as_secs() / 3_600),
+        seconds => format!("il y a {} j", seconds / 86_400),
+    }
 }
 
 fn show_message(title: &str, description: &str, level: MessageLevel) {

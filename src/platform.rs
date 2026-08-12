@@ -68,6 +68,14 @@ pub fn delete_with_administrator_privileges(
 }
 
 #[cfg(target_os = "macos")]
+pub fn restore_with_administrator_privileges(
+    history_directory: &Path,
+    target_directory: &Path,
+) -> Result<usize, ElevationError> {
+    run_with_administrator_privileges("restore", Some(history_directory), target_directory)
+}
+
+#[cfg(target_os = "macos")]
 fn run_with_administrator_privileges(
     operation: &str,
     source: Option<&Path>,

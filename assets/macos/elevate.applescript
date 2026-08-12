@@ -7,6 +7,8 @@ if operationName is "deploy" then
     set commandText to quoted form of executablePath & " --privileged-deploy " & quoted form of sourcePath & " " & quoted form of targetPath
 else if operationName is "delete" then
     set commandText to quoted form of executablePath & " --privileged-delete " & quoted form of targetPath
+else if operationName is "restore" then
+    set commandText to quoted form of executablePath & " --privileged-restore " & quoted form of sourcePath & " " & quoted form of targetPath
 else
     error "Opération privilégiée inconnue." number 64
 end if
