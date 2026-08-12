@@ -74,6 +74,7 @@ def detect_dmpconnect_dir():
         candidates.extend([
             os.path.expanduser("~/Library/Application Support/DmpConnect-JS2"),
             "/Applications/DmpConnect-JS2",
+            "/usr/local/dmpconnectjs2",
             "/usr/local/DmpConnect-JS2"
         ])
     
@@ -342,4 +343,4 @@ refresh_bouchon_list()
 root.protocol("WM_DELETE_WINDOW", root.quit)
 
 if __name__ == "__main__":
-    root.mainloop() 
+    root.mainloop()

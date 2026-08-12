@@ -31,6 +31,15 @@ pub struct DeploymentOutcome {
     pub replaced_files: usize,
 }
 
+impl DeployError {
+    pub fn is_permission_denied(&self) -> bool {
+        matches!(
+            self,
+            Self::Io { source, .. } if source.kind() == io::ErrorKind::PermissionDenied
+        )
+    }
+}
+
 pub fn resolve_bouchon_dir() -> PathBuf {
     if let Some(configured) = env::var_os("BOUCHON_DIR") {
         return PathBuf::from(configured);
@@ -250,8 +259,19 @@ fn dmpconnect_candidates() -> Vec<PathBuf> {
             );
         }
         candidates.push(PathBuf::from("/Applications/DmpConnect-JS2"));
+        candidates.push(PathBuf::from("/usr/local/dmpconnectjs2"));
         candidates.push(PathBuf::from("/usr/local/DmpConnect-JS2"));
     }
 
     candidates
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn macos_candidates_include_the_standard_installation_directory() {
+        assert!(dmpconnect_candidates().contains(&PathBuf::from("/usr/local/dmpconnectjs2")));
+    }
 }

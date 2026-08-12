@@ -5,11 +5,15 @@ use eframe::egui::{
 };
 use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
 
+#[cfg(target_os = "macos")]
+use crate::deployer::TARGET_NAME;
 use crate::deployer::{
     delete_existing_bouchons, deploy_bouchon, detect_dmpconnect_dir, list_bouchons,
     resolve_bouchon_dir,
 };
 use crate::platform;
+#[cfg(target_os = "macos")]
+use crate::platform::ElevationError;
 
 const BACKGROUND: Color32 = Color32::from_rgb(44, 62, 80);
 const SURFACE: Color32 = Color32::from_rgb(52, 73, 94);
@@ -104,14 +108,36 @@ impl BouchonneurApp {
 
         match deploy_bouchon(&source, &target_directory) {
             Ok(outcome) => {
-                let message = format!(
-                    "Bouchon déployé dans '{}'. {} ancien(s) fichier(s) remplacé(s).",
-                    outcome.target_path.display(),
-                    outcome.replaced_files
-                );
-                self.status = Status::Success(message.clone());
-                show_message("Déploiement réussi", &message, MessageLevel::Info);
+                self.show_deployment_success(&outcome.target_path, outcome.replaced_files)
             }
+            Err(error) => {
+                #[cfg(target_os = "macos")]
+                if error.is_permission_denied() {
+                    self.deploy_with_administrator_privileges(&source, &target_directory);
+                    return;
+                }
+
+                self.show_error(error.to_string());
+            }
+        }
+    }
+
+    fn show_deployment_success(&mut self, target_path: &Path, replaced_files: usize) {
+        let message = format!(
+            "Bouchon déployé dans '{}'. {replaced_files} ancien(s) fichier(s) remplacé(s).",
+            target_path.display(),
+        );
+        self.status = Status::Success(message.clone());
+        show_message("Déploiement réussi", &message, MessageLevel::Info);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn deploy_with_administrator_privileges(&mut self, source: &Path, target_directory: &Path) {
+        match platform::deploy_with_administrator_privileges(source, target_directory) {
+            Ok(replaced_files) => {
+                self.show_deployment_success(&target_directory.join(TARGET_NAME), replaced_files)
+            }
+            Err(ElevationError::Cancelled) => self.status = Status::Ready,
             Err(error) => self.show_error(error.to_string()),
         }
     }
@@ -139,6 +165,25 @@ impl BouchonneurApp {
             Ok(count) => {
                 self.status = Status::Success(format!("{count} fichier(s) .do supprimé(s)."));
             }
+            Err(error) => {
+                #[cfg(target_os = "macos")]
+                if error.is_permission_denied() {
+                    self.delete_with_administrator_privileges(&target_directory);
+                    return;
+                }
+
+                self.show_error(error.to_string());
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn delete_with_administrator_privileges(&mut self, target_directory: &Path) {
+        match platform::delete_with_administrator_privileges(target_directory) {
+            Ok(count) => {
+                self.status = Status::Success(format!("{count} fichier(s) .do supprimé(s)."));
+            }
+            Err(ElevationError::Cancelled) => self.status = Status::Ready,
             Err(error) => self.show_error(error.to_string()),
         }
     }

@@ -14,6 +14,7 @@ Fonctionnalités déjà disponibles dans la version Rust :
 - sélection manuelle du répertoire DmpConnect-JS2 ;
 - déploiement transactionnel avec restauration des anciens `.do` en cas d'échec ;
 - suppression explicite des fichiers `.do` après confirmation ;
+- demande des privilèges administrateur uniquement lors d'une écriture protégée sous macOS ;
 - interface accessible basée sur `eframe`/`egui`.
 
 Le bouton `Infos JDD`, l'élévation Windows et les paquets de distribution restent à finaliser.
@@ -137,6 +138,7 @@ VotreDossier/
 ### macOS
 - `~/Library/Application Support/DmpConnect-JS2`
 - `/Applications/DmpConnect-JS2`
+- `/usr/local/dmpconnectjs2` (installation standard constatée)
 - `/usr/local/DmpConnect-JS2`
 
 ## ⚠️ Notes importantes

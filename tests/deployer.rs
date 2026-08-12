@@ -1,6 +1,10 @@
 use std::fs;
+use std::io;
+use std::path::PathBuf;
 
-use bouchonneur::deployer::{TARGET_NAME, delete_existing_bouchons, deploy_bouchon, list_bouchons};
+use bouchonneur::deployer::{
+    DeployError, TARGET_NAME, delete_existing_bouchons, deploy_bouchon, list_bouchons,
+};
 use tempfile::tempdir;
 
 #[test]
@@ -71,4 +75,15 @@ fn explicitly_deletes_all_do_files_only() {
     assert!(!target_directory.path().join("one.do").exists());
     assert!(!target_directory.path().join("two.DO").exists());
     assert!(target_directory.path().join("keep.json").exists());
+}
+
+#[test]
+fn identifies_permission_denied_errors_for_targeted_elevation() {
+    let error = DeployError::Io {
+        action: "écrire",
+        path: PathBuf::from("/protected/directory"),
+        source: io::Error::from(io::ErrorKind::PermissionDenied),
+    };
+
+    assert!(error.is_permission_denied());
 }

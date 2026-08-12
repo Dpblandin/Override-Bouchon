@@ -56,6 +56,7 @@ L'application cherche automatiquement dans ces emplacements :
 **macOS :**
 - `~/Library/Application Support/DmpConnect-JS2`
 - `/Applications/DmpConnect-JS2`
+- `/usr/local/dmpconnectjs2` (installation standard constatée)
 - `/usr/local/DmpConnect-JS2`
 
 ### Sélection manuelle du dossier
@@ -133,4 +134,4 @@ Votre **Bouchonneur 🤖** est maintenant correctement configuré et prêt à d�
 
 ---
 
-**Bouchonneur 🤖 v1.0** - Prêt à bouchonner ! 🚀 
+**Bouchonneur 🤖 v1.0** - Prêt à bouchonner ! 🚀
