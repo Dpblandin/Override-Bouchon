@@ -1,5 +1,6 @@
 use std::io;
 use std::path::Path;
+#[cfg(not(target_os = "windows"))]
 use std::process::Command;
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -27,7 +28,7 @@ use windows_sys::Win32::System::Threading::{GetExitCodeProcess, INFINITE, WaitFo
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::UI::Shell::{SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW};
 #[cfg(target_os = "windows")]
-use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
+use windows_sys::Win32::UI::WindowsAndMessaging::{SW_HIDE, SW_SHOWNORMAL};
 
 #[cfg(target_os = "windows")]
 use crate::privileged::{PrivilegedResponse, read_privileged_response};
@@ -51,30 +52,37 @@ pub enum ElevationError {
     InvalidOutput(String),
 }
 
+#[cfg(target_os = "windows")]
 pub fn open_path(path: &Path) -> io::Result<()> {
-    #[cfg(target_os = "windows")]
-    let mut command = {
-        let mut command = Command::new("cmd");
-        command.args(["/C", "start", ""]);
-        command.arg(path);
-        command
+    let verb = wide_null(OsStr::new("open"));
+    let path = wide_null(path.as_os_str());
+    let mut shell_info = SHELLEXECUTEINFOW {
+        cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
+        lpVerb: verb.as_ptr(),
+        lpFile: path.as_ptr(),
+        lpParameters: null(),
+        lpDirectory: null(),
+        nShow: SW_SHOWNORMAL,
+        ..Default::default()
     };
 
-    #[cfg(target_os = "macos")]
-    let mut command = {
-        let mut command = Command::new("open");
-        command.arg(path);
-        command
-    };
+    // SAFETY: the verb and path are null-terminated buffers that outlive the call, and the
+    // structure is initialized with the documented size. ShellExecuteExW only mutates it.
+    if unsafe { ShellExecuteExW(&raw mut shell_info) } == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
 
-    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
-    let mut command = {
-        let mut command = Command::new("xdg-open");
-        command.arg(path);
-        command
-    };
+#[cfg(target_os = "macos")]
+pub fn open_path(path: &Path) -> io::Result<()> {
+    Command::new("open").arg(path).spawn().map(|_| ())
+}
 
-    command.spawn().map(|_| ())
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+pub fn open_path(path: &Path) -> io::Result<()> {
+    Command::new("xdg-open").arg(path).spawn().map(|_| ())
 }
 
 #[cfg(target_os = "macos")]

@@ -194,9 +194,11 @@ impl BouchonneurApp {
             .on_hover_cursor(CursorIcon::PointingHand);
 
         let mut open = self.bouchon_selector_open;
+        let mut opened_this_frame = false;
         if selector.clicked() {
             open = !open;
             if open {
+                opened_this_frame = true;
                 self.bouchon_filter.clear();
                 self.highlighted_bouchon = 0;
                 self.focus_bouchon_filter = true;
@@ -242,7 +244,7 @@ impl BouchonneurApp {
                     if arrow_up {
                         self.highlighted_bouchon = self.highlighted_bouchon.saturating_sub(1);
                     }
-                    if enter {
+                    if enter && !opened_this_frame {
                         chosen = matches.get(self.highlighted_bouchon).copied();
                     }
                     if escape {

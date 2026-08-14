@@ -6,7 +6,7 @@ use crate::catalog::BouchonCatalog;
 use crate::deployer::{
     DeployError, DeploymentOutcome, HistoryEntry, RestorationOutcome, TARGET_NAME,
     create_history_entry, delete_existing_bouchons, deploy_bouchon, discard_history_entry,
-    restore_latest_history,
+    finalize_history_entry, restore_latest_history,
 };
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use crate::platform::{self, ElevationError};
@@ -56,7 +56,10 @@ impl<'a> BouchonWorkflow<'a> {
             create_history_entry(target_directory, self.history_directory, self.catalog)?;
 
         match deploy_bouchon(source, target_directory) {
-            Ok(outcome) => Ok(WorkflowOutcome::Completed(outcome)),
+            Ok(outcome) => {
+                finalize_history(history_entry.as_ref());
+                Ok(WorkflowOutcome::Completed(outcome))
+            }
             Err(error) => {
                 #[cfg(any(target_os = "macos", target_os = "windows"))]
                 if error.is_permission_denied() {
@@ -65,10 +68,13 @@ impl<'a> BouchonWorkflow<'a> {
                         target_directory: target_directory.to_path_buf(),
                     };
                     return match platform::run_elevated(&command) {
-                        Ok(replaced_files) => Ok(WorkflowOutcome::Completed(DeploymentOutcome {
-                            target_path: target_directory.join(TARGET_NAME),
-                            replaced_files,
-                        })),
+                        Ok(replaced_files) => {
+                            finalize_history(history_entry.as_ref());
+                            Ok(WorkflowOutcome::Completed(DeploymentOutcome {
+                                target_path: target_directory.join(TARGET_NAME),
+                                replaced_files,
+                            }))
+                        }
                         Err(ElevationError::Cancelled) => {
                             discard_history(history_entry.as_ref());
                             Ok(WorkflowOutcome::Cancelled)
@@ -80,7 +86,9 @@ impl<'a> BouchonWorkflow<'a> {
                     };
                 }
 
-                discard_history(history_entry.as_ref());
+                if !error.target_may_be_modified() {
+                    discard_history(history_entry.as_ref());
+                }
                 Err(error.into())
             }
         }
@@ -91,7 +99,10 @@ impl<'a> BouchonWorkflow<'a> {
             create_history_entry(target_directory, self.history_directory, self.catalog)?;
 
         match delete_existing_bouchons(target_directory) {
-            Ok(deleted_files) => Ok(WorkflowOutcome::Completed(deleted_files)),
+            Ok(deleted_files) => {
+                finalize_history(history_entry.as_ref());
+                Ok(WorkflowOutcome::Completed(deleted_files))
+            }
             Err(error) => {
                 #[cfg(any(target_os = "macos", target_os = "windows"))]
                 if error.is_permission_denied() {
@@ -99,7 +110,10 @@ impl<'a> BouchonWorkflow<'a> {
                         target_directory: target_directory.to_path_buf(),
                     };
                     return match platform::run_elevated(&command) {
-                        Ok(deleted_files) => Ok(WorkflowOutcome::Completed(deleted_files)),
+                        Ok(deleted_files) => {
+                            finalize_history(history_entry.as_ref());
+                            Ok(WorkflowOutcome::Completed(deleted_files))
+                        }
                         Err(ElevationError::Cancelled) => {
                             discard_history(history_entry.as_ref());
                             Ok(WorkflowOutcome::Cancelled)
@@ -111,7 +125,9 @@ impl<'a> BouchonWorkflow<'a> {
                     };
                 }
 
-                discard_history(history_entry.as_ref());
+                if !error.target_may_be_modified() {
+                    discard_history(history_entry.as_ref());
+                }
                 Err(error.into())
             }
         }
@@ -148,5 +164,11 @@ impl<'a> BouchonWorkflow<'a> {
 fn discard_history(entry: Option<&HistoryEntry>) {
     if let Some(entry) = entry {
         let _ = discard_history_entry(entry);
+    }
+}
+
+fn finalize_history(entry: Option<&HistoryEntry>) {
+    if let Some(entry) = entry {
+        let _ = finalize_history_entry(entry);
     }
 }

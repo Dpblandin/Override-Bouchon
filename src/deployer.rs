@@ -4,7 +4,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use tempfile::{Builder, NamedTempFile};
+use tempfile::{Builder, NamedTempFile, TempDir};
 use thiserror::Error;
 
 use crate::catalog::BouchonCatalog;
@@ -30,6 +30,32 @@ pub enum DeployError {
     Io {
         action: &'static str,
         path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+
+    #[error(
+        "Impossible de restaurer '{path}' après l'échec de l'opération : {source}. Les fichiers récupérables sont conservés dans '{backup_directory}'."
+    )]
+    Rollback {
+        path: PathBuf,
+        backup_directory: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+
+    #[error("Impossible d'annuler complètement l'opération sur '{path}' : {source}")]
+    IncompleteRollback {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+
+    #[error(
+        "L'opération a abouti, mais le dossier temporaire '{backup_directory}' n'a pas pu être nettoyé : {source}"
+    )]
+    Cleanup {
+        backup_directory: PathBuf,
         #[source]
         source: io::Error,
     },
@@ -67,6 +93,13 @@ impl DeployError {
         matches!(
             self,
             Self::Io { source, .. } if source.kind() == io::ErrorKind::PermissionDenied
+        )
+    }
+
+    pub fn target_may_be_modified(&self) -> bool {
+        matches!(
+            self,
+            Self::Rollback { .. } | Self::IncompleteRollback { .. } | Self::Cleanup { .. }
         )
     }
 }
@@ -187,7 +220,6 @@ pub fn create_history_entry(
         file_count: files.len(),
     };
 
-    let _ = prune_history(&target_history);
     Ok(Some(entry))
 }
 
@@ -249,6 +281,14 @@ pub fn discard_history_entry(entry: &HistoryEntry) -> Result<(), DeployError> {
         .map_err(|source| io_error("supprimer la sauvegarde", &entry.directory, source))
 }
 
+pub fn finalize_history_entry(entry: &HistoryEntry) -> Result<(), DeployError> {
+    let target_history = entry
+        .directory
+        .parent()
+        .ok_or_else(|| DeployError::InvalidHistory(entry.directory.clone()))?;
+    prune_history(target_history)
+}
+
 pub fn restore_latest_history(
     target_directory: &Path,
     history_root: &Path,
@@ -273,26 +313,31 @@ pub fn restore_latest_history(
     }
 
     let existing_files = list_do_files(target_directory)?;
-    let backup = Builder::new()
-        .prefix(".bouchonneur-restore-")
-        .tempdir_in(target_directory)
-        .map_err(|source| io_error("préparer la restauration dans", target_directory, source))?;
-    let moved_files = move_to_backup(&existing_files, backup.path())?;
-    let mut installed_files = Vec::new();
+    let mut backup = FileBackup::new(target_directory, ".bouchonneur-restore-")?;
+    backup.move_files(&existing_files)?;
+    let mut installed_files: Vec<PathBuf> = Vec::new();
 
     for (filename, staged) in staged_files {
         let target_path = target_directory.join(filename);
         if let Err(error) = staged.persist(&target_path) {
+            let mut cleanup_error = None;
             for installed in installed_files.iter().rev() {
-                let _ = fs::remove_file(installed);
+                if let Err(source) = fs::remove_file(installed)
+                    && cleanup_error.is_none()
+                {
+                    cleanup_error = Some((installed.clone(), source));
+                }
             }
-            restore_backups(&moved_files);
+            backup.rollback()?;
+            if let Some((path, source)) = cleanup_error {
+                return Err(DeployError::IncompleteRollback { path, source });
+            }
             return Err(io_error("restaurer", &target_path, error.error));
         }
         installed_files.push(target_path);
     }
 
-    drop(backup);
+    backup.cleanup()?;
     let _ = discard_history_entry(entry);
 
     Ok(RestorationOutcome {
@@ -309,21 +354,17 @@ pub fn deploy_bouchon(
 
     let staged = stage_source(source, target_directory)?;
     let existing_files = list_do_files(target_directory)?;
-    let backup = Builder::new()
-        .prefix(".bouchonneur-backup-")
-        .tempdir_in(target_directory)
-        .map_err(|source| io_error("préparer la sauvegarde dans", target_directory, source))?;
-
-    let moved_files = move_to_backup(&existing_files, backup.path())?;
+    let mut backup = FileBackup::new(target_directory, ".bouchonneur-backup-")?;
+    backup.move_files(&existing_files)?;
     let target_path = target_directory.join(TARGET_NAME);
 
     if let Err(error) = staged.persist(&target_path) {
         let persist_error = error.error;
-        restore_backups(&moved_files);
+        backup.rollback()?;
         return Err(io_error("installer", &target_path, persist_error));
     }
 
-    drop(backup);
+    backup.cleanup()?;
 
     Ok(DeploymentOutcome {
         target_path,
@@ -339,20 +380,10 @@ pub fn delete_existing_bouchons(target_directory: &Path) -> Result<usize, Deploy
         return Ok(0);
     }
 
-    let trash = Builder::new()
-        .prefix(".bouchonneur-delete-")
-        .tempdir_in(target_directory)
-        .map_err(|source| io_error("préparer la suppression dans", target_directory, source))?;
-    let moved_files = move_to_backup(&existing_files, trash.path())?;
+    let mut trash = FileBackup::new(target_directory, ".bouchonneur-delete-")?;
+    trash.move_files(&existing_files)?;
 
-    if let Err(source) = trash.close() {
-        restore_backups(&moved_files);
-        return Err(io_error(
-            "supprimer les anciens bouchons dans",
-            target_directory,
-            source,
-        ));
-    }
+    trash.cleanup()?;
 
     Ok(existing_files.len())
 }
@@ -482,27 +513,86 @@ fn prune_history(target_history: &Path) -> Result<(), DeployError> {
     Ok(())
 }
 
-fn move_to_backup(
-    files: &[PathBuf],
-    backup_directory: &Path,
-) -> Result<Vec<(PathBuf, PathBuf)>, DeployError> {
-    let mut moved = Vec::new();
-
-    for original in files {
-        let backup_path = backup_directory.join(original.file_name().unwrap_or_default());
-        if let Err(source) = fs::rename(original, &backup_path) {
-            restore_backups(&moved);
-            return Err(io_error("mettre de côté", original, source));
-        }
-        moved.push((original.clone(), backup_path));
-    }
-
-    Ok(moved)
+struct FileBackup {
+    directory: Option<TempDir>,
+    moved_files: Vec<(PathBuf, PathBuf)>,
 }
 
-fn restore_backups(moved_files: &[(PathBuf, PathBuf)]) {
-    for (original, backup) in moved_files.iter().rev() {
-        let _ = fs::rename(backup, original);
+impl FileBackup {
+    fn new(target_directory: &Path, prefix: &str) -> Result<Self, DeployError> {
+        let directory = Builder::new()
+            .prefix(prefix)
+            .tempdir_in(target_directory)
+            .map_err(|source| io_error("préparer la sauvegarde dans", target_directory, source))?;
+        Ok(Self {
+            directory: Some(directory),
+            moved_files: Vec::new(),
+        })
+    }
+
+    fn move_files(&mut self, files: &[PathBuf]) -> Result<(), DeployError> {
+        for original in files {
+            let backup_path = self.path().join(original.file_name().unwrap_or_default());
+            if let Err(source) = fs::rename(original, &backup_path) {
+                let operation_error = io_error("mettre de côté", original, source);
+                self.rollback()?;
+                return Err(operation_error);
+            }
+            self.moved_files.push((original.clone(), backup_path));
+        }
+        Ok(())
+    }
+
+    fn rollback(&mut self) -> Result<(), DeployError> {
+        let mut first_error = None;
+        for (original, backup) in self.moved_files.iter().rev() {
+            if let Err(source) = fs::rename(backup, original)
+                && first_error.is_none()
+            {
+                first_error = Some((original.clone(), source));
+            }
+        }
+
+        if let Some((path, source)) = first_error {
+            let backup_directory = self.keep_directory();
+            return Err(DeployError::Rollback {
+                path,
+                backup_directory,
+                source,
+            });
+        }
+
+        self.moved_files.clear();
+        Ok(())
+    }
+
+    fn cleanup(mut self) -> Result<(), DeployError> {
+        let directory = self
+            .directory
+            .take()
+            .expect("a backup directory is available");
+        let backup_directory = directory.path().to_path_buf();
+        if let Err(source) = directory.close() {
+            return Err(DeployError::Cleanup {
+                backup_directory,
+                source,
+            });
+        }
+        Ok(())
+    }
+
+    fn path(&self) -> &Path {
+        self.directory
+            .as_ref()
+            .expect("a backup directory is available")
+            .path()
+    }
+
+    fn keep_directory(&mut self) -> PathBuf {
+        self.directory
+            .take()
+            .expect("a backup directory is available")
+            .keep()
     }
 }
 
@@ -544,12 +634,42 @@ fn dmpconnect_candidates() -> Vec<PathBuf> {
     candidates
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn macos_candidates_include_the_standard_installation_directory() {
         assert!(dmpconnect_candidates().contains(&PathBuf::from("/usr/local/dmpconnectjs2")));
+    }
+
+    #[test]
+    fn keeps_the_backup_directory_when_rollback_fails() {
+        let target = tempdir().expect("target directory");
+        let original = target.path().join("existing.do");
+        fs::write(&original, "existing bouchon").expect("existing bouchon");
+
+        let mut backup =
+            FileBackup::new(target.path(), ".rollback-test-").expect("backup directory");
+        backup
+            .move_files(std::slice::from_ref(&original))
+            .expect("move to backup");
+        fs::create_dir(&original).expect("block original path");
+
+        let error = backup.rollback().expect_err("rollback must fail");
+        let DeployError::Rollback {
+            backup_directory, ..
+        } = error
+        else {
+            panic!("unexpected error: {error}");
+        };
+
+        assert!(backup_directory.is_dir());
+        assert_eq!(
+            fs::read_to_string(backup_directory.join("existing.do")).expect("preserved backup"),
+            "existing bouchon"
+        );
     }
 }

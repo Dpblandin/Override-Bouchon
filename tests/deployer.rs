@@ -5,7 +5,8 @@ use std::path::PathBuf;
 use bouchonneur::catalog::BouchonCatalog;
 use bouchonneur::deployer::{
     DeployError, TARGET_NAME, create_history_entry, delete_existing_bouchons, deploy_bouchon,
-    detect_active_bouchon, list_history_entries, restore_latest_history,
+    detect_active_bouchon, discard_history_entry, finalize_history_entry, list_history_entries,
+    restore_latest_history,
 };
 use tempfile::tempdir;
 
@@ -156,4 +157,50 @@ fn restores_and_consumes_the_latest_history_entry() {
             .expect("history listing")
             .is_empty()
     );
+}
+
+#[test]
+fn prunes_history_only_after_an_operation_is_finalized() {
+    let target = tempdir().expect("target directory");
+    let history = tempdir().expect("history directory");
+    let active = target.path().join(TARGET_NAME);
+    let catalog = BouchonCatalog::new("");
+
+    for version in 0..20 {
+        fs::write(&active, format!("version {version}")).expect("active bouchon");
+        create_history_entry(target.path(), history.path(), &catalog)
+            .expect("history creation")
+            .expect("history entry");
+    }
+
+    fs::write(&active, "provisional version").expect("provisional bouchon");
+    let provisional = create_history_entry(target.path(), history.path(), &catalog)
+        .expect("provisional history creation")
+        .expect("provisional history entry");
+    assert_eq!(
+        list_history_entries(target.path(), history.path(), &catalog)
+            .expect("history before cancellation")
+            .len(),
+        21
+    );
+
+    discard_history_entry(&provisional).expect("discard provisional history");
+    assert_eq!(
+        list_history_entries(target.path(), history.path(), &catalog)
+            .expect("history after cancellation")
+            .len(),
+        20
+    );
+
+    let completed = create_history_entry(target.path(), history.path(), &catalog)
+        .expect("completed history creation")
+        .expect("completed history entry");
+    finalize_history_entry(&completed).expect("finalize completed history");
+    assert_eq!(
+        list_history_entries(target.path(), history.path(), &catalog)
+            .expect("history after completion")
+            .len(),
+        20
+    );
+    assert!(completed.directory.exists());
 }
